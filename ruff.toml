@@ -1,0 +1,9 @@
+line-length = 120
+
+[lint]
+# S: the bandit security rules, so every subprocess call and URL open is a deliberate,
+# commented exception rather than an oversight.
+select = ["E", "F", "I", "B", "S", "RUF"]
+
+[lint.per-file-ignores]
+"test_*.py" = ["S101"]

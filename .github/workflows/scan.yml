@@ -1,0 +1,102 @@
+name: Scan, sign, publish
+
+# Weekly. Only this scheduled run can sign (the client requires the `schedule`
+# trigger in the signing certificate) or deploy (the Google provider accepts only
+# this workflow, on main, from a schedule). A manual or PR run can do neither.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions: {}
+
+concurrency:
+  group: scan-sign-publish
+  cancel-in-progress: false
+
+jobs:
+  # Reads untrusted model files, so it holds only the read-only Hugging Face token:
+  # no identity token, no write access. Its output is re-checked before signing.
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # The scanner image: pinned base image, hash-pinned packages. Each repo is
+      # scanned in its own throwaway, read-only container from it.
+      - run: docker build --pull -t hayward-verify-scanner:local .
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends age
+      - name: Scan the most downloaded models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python verify_service.py scan --top 100 --out out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: receipts
+          path: out
+          retention-days: 3
+          if-no-files-found: error
+      # age-encrypted to the reviewer's key, so safe in a public repo's artifacts.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: withheld
+          path: withheld.json.age
+          retention-days: 30
+          if-no-files-found: error
+
+  # Holds only the OIDC identity Sigstore signs with. Checks every receipt against
+  # the Hub and refuses a flagged one before signing.
+  sign:
+    needs: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --require-hashes --no-deps -r requirements.txt
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: receipts
+          path: out
+      - run: python verify_service.py sign out site
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site
+          path: site
+          retention-days: 3
+          if-no-files-found: error
+
+  # Holds only the keyless Google login for the isolated hedgerow-verify project.
+  # Standard library only: no packages installed.
+  deploy:
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site
+          path: site
+      - run: python verify_service.py deploy site
