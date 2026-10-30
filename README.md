@@ -8,7 +8,7 @@ pip install "hayward[sign]"
 hayward verify org/name ./downloaded-snapshot
 ```
 
-Every week this repo scans the most downloaded models with `hayward hub` at their
+Every 6 hours this repo scans the most downloaded models with `hayward hub` at their
 current commit, signs each verdict with Sigstore, and publishes it. A verdict is
 analysis evidence, not a safety certificate.
 
@@ -21,12 +21,12 @@ analysis evidence, not a safety certificate.
   to Hugging Face. A signed "withheld" marker after a 30-day disclosure window is
   planned, not built yet.
 - So "no published verdict" means not scanned yet, or withheld. It is never a pass.
-- Verdicts are re-signed weekly and stop counting after 30 days.
+- Verdicts are re-signed every 6 hours and stop counting after 30 days.
 
 ## Why you can trust a verdict
 
 - **One signer.** Verdicts are signed by `.github/workflows/scan.yml` on `main`,
-  started by its weekly schedule. `hayward verify` accepts nothing else: not a manual
+  started by its schedule. `hayward verify` accepts nothing else: not a manual
   run, not a pull request, not another workflow.
 - **Tied to the exact commit.** Each verdict names the repo and commit, and its file
   hashes must match the Hub's.
