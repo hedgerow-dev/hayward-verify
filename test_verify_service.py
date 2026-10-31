@@ -85,6 +85,19 @@ def test_a_receipt_for_another_repo_is_not_trusted(monkeypatch, tmp_path):
     assert vs.scan_repo("org/clean", tmp_path / "0") is None
 
 
+def test_a_receipt_that_covers_no_files_is_not_published(monkeypatch, tmp_path):
+    # A repo whose files were all too big to scan, or that holds no model files: the
+    # sign job refuses an empty receipt, and one refusal blocks every verdict in the run.
+    def fake_run(cmd, **kwargs):
+        empty = statement("org/clean")
+        empty["subject"], empty["predicate"]["files"] = [], {}
+        (tmp_path / "0" / "out" / "receipt.json").write_text(json.dumps(empty))
+        return Namespace(returncode=0)
+
+    monkeypatch.setattr(vs.subprocess, "run", fake_run)
+    assert vs.scan_repo("org/clean", tmp_path / "0") is None
+
+
 def test_each_scan_runs_in_a_locked_down_container(monkeypatch, tmp_path):
     seen = {}
 

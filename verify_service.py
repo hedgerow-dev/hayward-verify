@@ -122,7 +122,9 @@ def scan_repo(repo: str, work: Path) -> dict | None:
         return None
     statement = json.loads(receipt.read_text(encoding="utf-8"))
     source = statement.get("predicate", {}).get("source", {})
-    return statement if source.get("repo") == repo else None
+    # A receipt that covers no files (all too big to scan, or no model files at all)
+    # vouches for nothing, and the sign job would refuse it and with it the whole run.
+    return statement if source.get("repo") == repo and statement.get("subject") else None
 
 
 def verdicts(statement: dict) -> list[str]:
