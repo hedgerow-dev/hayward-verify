@@ -56,6 +56,9 @@ ENTRY_KEYS = ("verdict", "rules", "coverage_gaps", "read", "hash_source")
 RULE_RE = re.compile(r"MFV-[A-Z0-9]+-[0-9]{3}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REPORT_BLOCK = 256 * 1024  # the withheld report is padded to a multiple of this
+NEW_SLACK = timedelta(minutes=30)  # runs overlap by this much, so a late run misses nothing
+PER_OWNER_CAP = 20  # new repos per uploader scanned before everyone else's are
+MAX_LIST_PAGES = 50  # 1,000 repos a page: far more than any 6-hour window holds
 CHECKPOINT_TYPE = "https://hedgerow.dev/hayward/checkpoint/v1"
 # A verdict not rescanned stays in the checkpoint this long after its scan: the same
 # limit the client puts on a per-repo bundle.
@@ -93,6 +96,70 @@ def top_repos(count: int) -> list[str]:
     return [str(m["id"]) for m in models if isinstance(m, dict) and "id" in m]
 
 
+def _page(url: str) -> tuple[bytes, str | None]:
+    """One page of a Hub listing and the URL of the next, from its Link header."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("refusing a non-https URL")
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:  # noqa: S310 - https checked
+        body = resp.read()
+        link = resp.headers.get("Link", "")
+    nxt = next((part.split(";")[0].strip(" <>") for part in link.split(",") if 'rel="next"' in part), None)
+    if nxt is not None and not nxt.startswith(f"{HUB}/api/models?"):
+        raise ValueError("the Hub's next page is not a model listing")
+    return body, nxt
+
+
+def new_repos(hours: float, now: datetime) -> list[str]:
+    """Public, ungated model repos changed in the last ``hours`` (plus slack, so runs
+    overlap) that hold a file Hayward scans, newest first. One listing page carries each
+    repo's file list, so a 6-hour window costs a few API calls, not one per repo."""
+    from hayward import hub
+
+    suffixes = hub._scannable_suffixes()
+    since = now - timedelta(hours=hours) - NEW_SLACK
+    query = urllib.parse.urlencode([("sort", "lastModified"), ("direction", "-1"), ("limit", "1000"),
+                                    ("expand[]", "lastModified"), ("expand[]", "siblings"),
+                                    ("expand[]", "gated"), ("expand[]", "private")])
+    url: str | None = f"{HUB}/api/models?{query}"
+    repos: list[str] = []
+    later: list[str] = []
+    per_owner: dict[str, int] = {}
+    for _ in range(MAX_LIST_PAGES):
+        if url is None:
+            break
+        body, url = _page(url)
+        page = json.loads(body)
+        for m in page if isinstance(page, list) else []:
+            if not isinstance(m, dict):
+                continue
+            try:
+                when = datetime.fromisoformat(str(m.get("lastModified")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if when < since:
+                return repos + later
+            repo = str(m.get("id", ""))
+            siblings = m.get("siblings") if isinstance(m.get("siblings"), list) else []
+            if (not hub.REPO_RE.fullmatch(repo) or m.get("private") or m.get("gated")
+                    or not any(isinstance(f, dict) and hub._wanted(str(f.get("rfilename", "")), suffixes)
+                               for f in siblings)):
+                continue
+            # One uploader cannot crowd out the rest: past its share, its repos go to the
+            # back of the queue. They are still scanned, after everyone else's.
+            owner = repo.split("/", 1)[0]
+            per_owner[owner] = per_owner.get(owner, 0) + 1
+            (repos if per_owner[owner] <= PER_OWNER_CAP else later).append(repo)
+    return repos + later
+
+
+def shard_of(repos: list[str], shard: str) -> list[str]:
+    """Shard ``i/n`` of ``repos``: every n-th one from the i-th."""
+    index, _, count = shard.partition("/")
+    if not (index.isdigit() and count.isdigit() and int(index) < int(count)):
+        raise ValueError(f"--shard must be i/n with 0 <= i < n, not {shard!r}")
+    return repos[int(index)::int(count)]
+
+
 def scan_repo(repo: str, work: Path) -> dict | None:
     """Run `hayward hub` on one repo in a throwaway container; return its receipt, or None.
 
@@ -106,7 +173,8 @@ def scan_repo(repo: str, work: Path) -> dict | None:
     for folder in (out, scratch):
         folder.mkdir(parents=True)
         folder.chmod(0o777)  # written by the container's nobody user
-    cmd = ["docker", "run", "--rm", "--read-only", "--cap-drop", "ALL",
+    name = f"hayward-scan-{os.getpid()}-{work.name}"
+    cmd = ["docker", "run", "--rm", "--name", name, "--read-only", "--cap-drop", "ALL",
            "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "6g",
            "--user", "65534:65534", "-v", f"{out}:/work", "-v", f"{scratch}:/tmp",
            "-e", "HF_TOKEN", "-e", "HOME=/tmp", SCANNER_IMAGE,
@@ -116,6 +184,9 @@ def scan_repo(repo: str, work: Path) -> dict | None:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,  # noqa: S603 - fixed argv
                                 env=env, timeout=SCAN_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired:
+        # Killing the client leaves the container running; stop it, or slow repos pile up.
+        subprocess.run(["docker", "kill", name], stdout=subprocess.DEVNULL,  # noqa: S603, S607 - fixed argv
+                       stderr=subprocess.DEVNULL, timeout=60, check=False)
         return None
     receipt = out / "receipt.json"
     if result.returncode not in (0, 1) or not receipt.is_file():
@@ -145,9 +216,17 @@ def encrypt_for_review(report: list[dict], out: Path) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     out = Path(args.out)
+    report = out.parent / "withheld.json.age"
     published, withheld, failed = 0, [], 0
+    # Always written, and padded, so neither its presence nor its size says whether
+    # anything was withheld. Written first and again on each finding, so a run cut
+    # short by a timeout still leaves what it found for review.
+    encrypt_for_review(withheld, report)
     with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
-        repos = top_repos(args.top)
+        if getattr(args, "repos", None):
+            repos = shard_of(json.loads(Path(args.repos).read_text(encoding="utf-8")), args.shard or "0/1")
+        else:
+            repos = top_repos(args.top)
         for index, repo in enumerate(repos):
             statement = scan_repo(repo, Path(tmp) / str(index))
             # No file to vouch for (only big GGUF files, only YAML): nothing to publish,
@@ -158,20 +237,25 @@ def cmd_scan(args: argparse.Namespace) -> int:
             sha = statement["predicate"]["source"]["revision"]
             if "flagged" in verdicts(statement):
                 withheld.append({"repo": repo, "revision": sha, "files": statement["predicate"]["files"]})
+                encrypt_for_review(withheld, report)
                 continue
             dest = out / "v1" / "hf" / repo / f"{sha}.intoto.json"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(json.dumps(statement, indent=1) + "\n", encoding="utf-8")
             published += 1
-    # Always written, and padded, so neither its presence nor its size says whether
-    # anything was withheld.
-    encrypt_for_review(withheld, out.parent / "withheld.json.age")
     # Every repo this run scanned, withheld or not: deploy drops their older verdicts.
     # The same public top-N list, so it names nothing the site does not.
     (out.parent / "scanned.json").write_text(json.dumps(repos), encoding="utf-8")
     # The total only: a split into published, withheld and failed, set against the
     # public site and the public top-N list, would name the withheld repos.
     print(f"scanned {published + len(withheld) + failed} repo(s)")
+    return 0
+
+
+def cmd_list_new(args: argparse.Namespace) -> int:
+    repos = new_repos(args.hours, datetime.now(timezone.utc))
+    Path(args.out).write_text(json.dumps(repos), encoding="utf-8")
+    print(f"listed {len(repos)} repo(s) changed in the last {args.hours:g} hour(s)")
     return 0
 
 
@@ -556,12 +640,17 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     scan = sub.add_parser("scan")
     scan.add_argument("--top", type=int, default=100)
+    scan.add_argument("--repos", help="a JSON list of repos to scan instead of the top list")
+    scan.add_argument("--shard", help="with --repos, scan only shard i/n of it")
     scan.add_argument("--out", required=True)
     sign = sub.add_parser("sign")
     sign.add_argument("--top", type=int, default=100)
     sign.add_argument("--scanned", required=True, help="scanned.json from the scan job")
     sign.add_argument("src")
     sign.add_argument("site")
+    list_new = sub.add_parser("list-new", help="list repos changed on the Hub in the last HOURS")
+    list_new.add_argument("--hours", type=float, default=6)
+    list_new.add_argument("--out", required=True)
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--top", type=int, default=100)
     deploy.add_argument("--scanned", required=True, help="scanned.json from the scan job")
@@ -569,7 +658,8 @@ def main(argv: list[str] | None = None) -> int:
     monitor = sub.add_parser("monitor", help="check the published checkpoint chain")
     monitor.add_argument("--known", help="a file of checkpoint digests seen before, kept up to date")
     args = parser.parse_args(argv)
-    return {"scan": cmd_scan, "sign": cmd_sign, "deploy": cmd_deploy, "monitor": cmd_monitor}[args.command](args)
+    return {"scan": cmd_scan, "list-new": cmd_list_new, "sign": cmd_sign, "deploy": cmd_deploy,
+            "monitor": cmd_monitor}[args.command](args)
 
 
 if __name__ == "__main__":

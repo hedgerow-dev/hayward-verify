@@ -144,6 +144,107 @@ def test_the_withheld_report_is_always_written_and_padded(monkeypatch, tmp_path)
     assert sizes[0] == sizes[1] == vs.REPORT_BLOCK
 
 
+# ---- new uploads -------------------------------------------------------------------------
+
+NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+
+
+def model(repo: str, minutes_ago: int, files=("model.safetensors", "config.json"), gated=False) -> dict:
+    when = (NOW - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", ".000Z")
+    return {"id": repo, "lastModified": when, "gated": gated, "private": False,
+            "siblings": [{"rfilename": f} for f in files]}
+
+
+@pytest.fixture
+def listing(monkeypatch):
+    """The Hub's model listing, newest first, served in pages."""
+    pages: list[list[dict]] = []
+    urls: list[str] = []
+
+    def page(url):
+        urls.append(url)
+        index = int(url.split("cursor=")[1]) if "cursor=" in url else 0
+        nxt = f"{vs.HUB}/api/models?cursor={index + 1}" if index + 1 < len(pages) else None
+        return json.dumps(pages[index]).encode(), nxt
+
+    monkeypatch.setattr(vs, "_page", page)
+    return pages, urls
+
+
+def test_new_repos_lists_the_window_and_stops_at_its_edge(listing):
+    pages, urls = listing
+    pages += [[model("a/one", 5), model("b/two", 200)], [model("c/three", 380), model("d/old", 500)],
+              [model("e/never", 600)]]
+    assert vs.new_repos(6, NOW) == ["a/one", "b/two", "c/three"]  # 6 h plus 30 min slack
+    assert len(urls) == 2 and "sort=lastModified" in urls[0] and "siblings" in urls[0]
+
+
+def test_new_repos_skips_what_cannot_or_need_not_be_scanned(listing):
+    pages, _ = listing
+    pages.append([model("a/gated", 1, gated="manual"), model("a/docs", 2, files=("README.md", "logo.png")),
+                  model("a/ok", 3)])
+    assert vs.new_repos(6, NOW) == ["a/ok"]
+
+
+def test_one_owner_cannot_crowd_out_the_rest(listing):
+    # Past its share, an owner's repos wait at the back of the queue: none is dropped.
+    pages, _ = listing
+    pages.append([model(f"spam/r{i}", i) for i in range(vs.PER_OWNER_CAP + 5)] + [model("other/r", 50)])
+    repos = vs.new_repos(6, NOW)
+    assert len(repos) == vs.PER_OWNER_CAP + 6
+    assert repos.index("other/r") == vs.PER_OWNER_CAP
+    assert repos[-5:] == [f"spam/r{i}" for i in range(vs.PER_OWNER_CAP, vs.PER_OWNER_CAP + 5)]
+
+
+def test_a_malformed_listing_entry_is_skipped(listing):
+    pages, _ = listing
+    pages.append(["junk", {"id": "a/b"}, {**model("c/d", 1), "siblings": None}, model("e/f", 2)])
+    assert vs.new_repos(6, NOW) == ["e/f"]
+
+
+def test_a_timed_out_container_is_killed(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            raise vs.subprocess.TimeoutExpired(cmd, 1)
+        return vs.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(vs.subprocess, "run", fake_run)
+    assert vs.scan_repo("org/slow", tmp_path / "0") is None
+    name = calls[0][calls[0].index("--name") + 1]
+    assert calls[1] == ["docker", "kill", name]
+
+
+def test_the_review_report_is_written_before_and_during_the_scan(scanned, monkeypatch):
+    # A shard cut short by a timeout still leaves what it found.
+    out, _ = scanned
+    reports = []
+    monkeypatch.setattr(vs, "encrypt_for_review", lambda report, path: reports.append([w["repo"] for w in report]))
+    vs.cmd_scan(Namespace(top=4, out=str(out)))
+    assert reports == [[], ["evil/secret"]]
+
+
+def test_a_shard_scans_its_share_of_the_list(scanned, tmp_path, monkeypatch):
+    out, _ = scanned
+    repos = ["org/clean", "org/code", "evil/secret", "org/broken"]
+    (tmp_path / "new.json").write_text(json.dumps(repos))
+    monkeypatch.setattr(vs, "top_repos", lambda n: pytest.fail("a list was given"))
+    seen = []
+    real = vs.scan_repo
+    monkeypatch.setattr(vs, "scan_repo", lambda repo, work: seen.append(repo) or real(repo, work))
+    vs.cmd_scan(Namespace(top=100, out=str(out), repos=str(tmp_path / "new.json"), shard="1/2"))
+    assert seen == ["org/code", "org/broken"]
+    assert json.loads((out.parent / "scanned.json").read_text()) == seen
+
+
+@pytest.mark.parametrize("bad", ["2/2", "-1/2", "0/0", "a/b", "1"])
+def test_a_shard_must_be_i_of_n(bad):
+    with pytest.raises(ValueError):
+        vs.shard_of(["x"], bad)
+
+
 # ---- sign --------------------------------------------------------------------------------
 
 @pytest.fixture

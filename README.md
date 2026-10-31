@@ -23,6 +23,14 @@ analysis evidence, not a safety certificate.
 - So "no published verdict" means not scanned yet, or withheld. It is never a pass.
 - Verdicts are re-signed every 6 hours and stop counting after 30 days.
 
+## New uploads (dry run)
+
+A second workflow scans the model repos changed on the Hub in the last 6 hours, in
+8 shards, with the same locked-down containers. It signs and publishes nothing yet:
+it measures run time and the Hub's rate limits first. A flagged repo goes only into
+the encrypted review report. Past 20 repos in a run, an uploader's repos wait at the
+back of the queue, so one account cannot crowd out the rest.
+
 ## The verdict log
 
 Each run also signs one **checkpoint**: the list of verdicts that are current, indexed
