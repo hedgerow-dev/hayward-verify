@@ -28,7 +28,8 @@ analysis evidence, not a safety certificate.
 A second workflow scans the model repos changed on the Hub in the last 6 hours, in
 8 shards, with the same locked-down containers. It signs and publishes nothing yet:
 it measures run time and the Hub's rate limits first. A flagged repo goes only into
-the encrypted review report. At most 20 repos per uploader are scanned per run.
+the encrypted review report. Past 20 repos in a run, an uploader's repos wait at the
+back of the queue, so one account cannot crowd out the rest.
 
 ## The verdict log
 

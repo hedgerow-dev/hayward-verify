@@ -186,11 +186,44 @@ def test_new_repos_skips_what_cannot_or_need_not_be_scanned(listing):
     assert vs.new_repos(6, NOW) == ["a/ok"]
 
 
-def test_one_owner_cannot_flood_the_queue(listing):
+def test_one_owner_cannot_crowd_out_the_rest(listing):
+    # Past its share, an owner's repos wait at the back of the queue: none is dropped.
     pages, _ = listing
     pages.append([model(f"spam/r{i}", i) for i in range(vs.PER_OWNER_CAP + 5)] + [model("other/r", 50)])
     repos = vs.new_repos(6, NOW)
-    assert sum(r.startswith("spam/") for r in repos) == vs.PER_OWNER_CAP and "other/r" in repos
+    assert len(repos) == vs.PER_OWNER_CAP + 6
+    assert repos.index("other/r") == vs.PER_OWNER_CAP
+    assert repos[-5:] == [f"spam/r{i}" for i in range(vs.PER_OWNER_CAP, vs.PER_OWNER_CAP + 5)]
+
+
+def test_a_malformed_listing_entry_is_skipped(listing):
+    pages, _ = listing
+    pages.append(["junk", {"id": "a/b"}, {**model("c/d", 1), "siblings": None}, model("e/f", 2)])
+    assert vs.new_repos(6, NOW) == ["e/f"]
+
+
+def test_a_timed_out_container_is_killed(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "run"]:
+            raise vs.subprocess.TimeoutExpired(cmd, 1)
+        return vs.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(vs.subprocess, "run", fake_run)
+    assert vs.scan_repo("org/slow", tmp_path / "0") is None
+    name = calls[0][calls[0].index("--name") + 1]
+    assert calls[1] == ["docker", "kill", name]
+
+
+def test_the_review_report_is_written_before_and_during_the_scan(scanned, monkeypatch):
+    # A shard cut short by a timeout still leaves what it found.
+    out, _ = scanned
+    reports = []
+    monkeypatch.setattr(vs, "encrypt_for_review", lambda report, path: reports.append([w["repo"] for w in report]))
+    vs.cmd_scan(Namespace(top=4, out=str(out)))
+    assert reports == [[], ["evil/secret"]]
 
 
 def test_a_shard_scans_its_share_of_the_list(scanned, tmp_path, monkeypatch):

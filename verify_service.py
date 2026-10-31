@@ -57,7 +57,8 @@ RULE_RE = re.compile(r"MFV-[A-Z0-9]+-[0-9]{3}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REPORT_BLOCK = 256 * 1024  # the withheld report is padded to a multiple of this
 NEW_SLACK = timedelta(minutes=30)  # runs overlap by this much, so a late run misses nothing
-PER_OWNER_CAP = 20  # new repos per uploader per run
+PER_OWNER_CAP = 20  # new repos per uploader scanned before everyone else's are
+MAX_LIST_PAGES = 50  # 1,000 repos a page: far more than any 6-hour window holds
 CHECKPOINT_TYPE = "https://hedgerow.dev/hayward/checkpoint/v1"
 # A verdict not rescanned stays in the checkpoint this long after its scan: the same
 # limit the client puts on a per-repo bundle.
@@ -121,24 +122,34 @@ def new_repos(hours: float, now: datetime) -> list[str]:
                                     ("expand[]", "gated"), ("expand[]", "private")])
     url: str | None = f"{HUB}/api/models?{query}"
     repos: list[str] = []
+    later: list[str] = []
     per_owner: dict[str, int] = {}
-    while url:
+    for _ in range(MAX_LIST_PAGES):
+        if url is None:
+            break
         body, url = _page(url)
-        for m in json.loads(body):
-            when = datetime.fromisoformat(str(m.get("lastModified", "")).replace("Z", "+00:00"))
+        page = json.loads(body)
+        for m in page if isinstance(page, list) else []:
+            if not isinstance(m, dict):
+                continue
+            try:
+                when = datetime.fromisoformat(str(m.get("lastModified")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
             if when < since:
-                return repos
+                return repos + later
             repo = str(m.get("id", ""))
-            owner = repo.split("/", 1)[0]
+            siblings = m.get("siblings") if isinstance(m.get("siblings"), list) else []
             if (not hub.REPO_RE.fullmatch(repo) or m.get("private") or m.get("gated")
-                    or not any(hub._wanted(str(f.get("rfilename", "")), suffixes) for f in m.get("siblings", []))):
+                    or not any(isinstance(f, dict) and hub._wanted(str(f.get("rfilename", "")), suffixes)
+                               for f in siblings)):
                 continue
-            # One uploader cannot flood the queue: the rest of its repos wait for a later run.
-            if per_owner.get(owner, 0) >= PER_OWNER_CAP:
-                continue
+            # One uploader cannot crowd out the rest: past its share, its repos go to the
+            # back of the queue. They are still scanned, after everyone else's.
+            owner = repo.split("/", 1)[0]
             per_owner[owner] = per_owner.get(owner, 0) + 1
-            repos.append(repo)
-    return repos
+            (repos if per_owner[owner] <= PER_OWNER_CAP else later).append(repo)
+    return repos + later
 
 
 def shard_of(repos: list[str], shard: str) -> list[str]:
@@ -162,7 +173,8 @@ def scan_repo(repo: str, work: Path) -> dict | None:
     for folder in (out, scratch):
         folder.mkdir(parents=True)
         folder.chmod(0o777)  # written by the container's nobody user
-    cmd = ["docker", "run", "--rm", "--read-only", "--cap-drop", "ALL",
+    name = f"hayward-scan-{os.getpid()}-{work.name}"
+    cmd = ["docker", "run", "--rm", "--name", name, "--read-only", "--cap-drop", "ALL",
            "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "6g",
            "--user", "65534:65534", "-v", f"{out}:/work", "-v", f"{scratch}:/tmp",
            "-e", "HF_TOKEN", "-e", "HOME=/tmp", SCANNER_IMAGE,
@@ -172,6 +184,9 @@ def scan_repo(repo: str, work: Path) -> dict | None:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,  # noqa: S603 - fixed argv
                                 env=env, timeout=SCAN_TIMEOUT_SECONDS, check=False)
     except subprocess.TimeoutExpired:
+        # Killing the client leaves the container running; stop it, or slow repos pile up.
+        subprocess.run(["docker", "kill", name], stdout=subprocess.DEVNULL,  # noqa: S603, S607 - fixed argv
+                       stderr=subprocess.DEVNULL, timeout=60, check=False)
         return None
     receipt = out / "receipt.json"
     if result.returncode not in (0, 1) or not receipt.is_file():
@@ -201,7 +216,12 @@ def encrypt_for_review(report: list[dict], out: Path) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     out = Path(args.out)
+    report = out.parent / "withheld.json.age"
     published, withheld, failed = 0, [], 0
+    # Always written, and padded, so neither its presence nor its size says whether
+    # anything was withheld. Written first and again on each finding, so a run cut
+    # short by a timeout still leaves what it found for review.
+    encrypt_for_review(withheld, report)
     with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
         if getattr(args, "repos", None):
             repos = shard_of(json.loads(Path(args.repos).read_text(encoding="utf-8")), args.shard or "0/1")
@@ -217,14 +237,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
             sha = statement["predicate"]["source"]["revision"]
             if "flagged" in verdicts(statement):
                 withheld.append({"repo": repo, "revision": sha, "files": statement["predicate"]["files"]})
+                encrypt_for_review(withheld, report)
                 continue
             dest = out / "v1" / "hf" / repo / f"{sha}.intoto.json"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(json.dumps(statement, indent=1) + "\n", encoding="utf-8")
             published += 1
-    # Always written, and padded, so neither its presence nor its size says whether
-    # anything was withheld.
-    encrypt_for_review(withheld, out.parent / "withheld.json.age")
     # Every repo this run scanned, withheld or not: deploy drops their older verdicts.
     # The same public top-N list, so it names nothing the site does not.
     (out.parent / "scanned.json").write_text(json.dumps(repos), encoding="utf-8")

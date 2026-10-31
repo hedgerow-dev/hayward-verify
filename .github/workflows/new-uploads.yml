@@ -6,7 +6,9 @@ name: New uploads (dry run)
 # Flagged repos go only into the age-encrypted review report, as in the main scan.
 on:
   schedule:
-    - cron: "47 */6 * * *"
+    # 01:47, 07:47, ...: clear of the main scan at :17 every 6 hours, which shares
+    # the Hugging Face token and its rate limit.
+    - cron: "47 1-23/6 * * *"
 
 permissions: {}
 
@@ -62,13 +64,17 @@ jobs:
         with:
           name: new-list
           path: .
+      # Shorter than the job's limit, so the report upload below still runs.
       - name: Scan this shard
+        timeout-minutes: 270
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           SHARD: ${{ matrix.shard }}
         run: python verify_service.py scan --repos new.json --shard "$SHARD/8" --out out
       # age-encrypted to the reviewer's key, so safe in a public repo's artifacts.
+      # Uploaded even when the scan step fails or times out: it holds what was found.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
         with:
           name: withheld-${{ matrix.shard }}
           path: withheld.json.age
