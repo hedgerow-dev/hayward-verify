@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import gzip
 import json
+import shutil
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from hayward import __version__, receipt
@@ -123,6 +125,12 @@ def signing(monkeypatch, tmp_path):
     monkeypatch.setattr(vs, "hub_hashes", lambda repo, sha: {"model.safetensors": LFS})
     monkeypatch.setattr(vs, "top_repos", lambda n: ["org/clean", "evil/secret", "other/repo"])
     monkeypatch.setattr(receipt, "_sigstore_sign", lambda raw: json.dumps({"signed": raw.decode()}))
+    monkeypatch.setattr(receipt, "_sigstore_open", lambda raw, *pins: json.loads(raw)["signed"].encode())
+    (tmp_path / "scanned.json").write_text(json.dumps(["org/clean", "evil/secret", "other/repo"]))
+    # The published site, as deploy leaves it: every run's files, carried forward.
+    public = tmp_path / "public"
+    monkeypatch.setattr(vs, "fetch_public", lambda path: (public / path).read_bytes()
+                        if (public / path).is_file() else None)
 
     def put(repo, st, path=None):
         dest = src / (path or f"v1/hf/{repo}/{SHA}.intoto.json")
@@ -135,7 +143,7 @@ def signing(monkeypatch, tmp_path):
 def test_sign_writes_a_bundle_where_the_client_looks(signing):
     src, site, put = signing
     put("org/clean", statement("org/clean"))
-    assert vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site))) == 0
+    assert vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json"))) == 0
     assert (site / f"v1/hf/org/clean/{SHA}.sigstore.json").is_file()
 
 
@@ -143,7 +151,7 @@ def test_sign_refuses_a_flagged_verdict(signing):
     src, site, put = signing
     put("evil/secret", statement("evil/secret", "flagged"))
     with pytest.raises(SystemExit):
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
     assert not site.exists()
 
 
@@ -151,7 +159,7 @@ def test_sign_refuses_a_receipt_filed_under_another_repo(signing):
     src, site, put = signing
     put("org/clean", statement("other/repo"), path=f"v1/hf/org/clean/{SHA}.intoto.json")
     with pytest.raises(SystemExit):
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
 
 
 def test_sign_refuses_hashes_the_hub_does_not_confirm(signing, monkeypatch):
@@ -159,7 +167,161 @@ def test_sign_refuses_hashes_the_hub_does_not_confirm(signing, monkeypatch):
     put("org/clean", statement("org/clean"))
     monkeypatch.setattr(vs, "hub_hashes", lambda repo, sha: {"model.safetensors": "c" * 64})
     with pytest.raises(SystemExit):
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
+
+
+def sha256(body: bytes) -> str:
+    return vs.hashlib.sha256(body).hexdigest()
+
+
+def run_sign(signing, tmp_path, run: int, scanned: list[str]) -> Path:
+    """Sign what is in the scan output into a fresh site, publish it, and clear the output."""
+    src, _, _ = signing
+    site = tmp_path / f"site{run}"
+    (tmp_path / "scanned.json").write_text(json.dumps(scanned))
+    vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(tmp_path / "scanned.json")))
+    shutil.copytree(site, tmp_path / "public", dirs_exist_ok=True)
+    shutil.rmtree(src)
+    return site
+
+
+def checkpoint(site: Path, run: int) -> tuple[bytes, dict]:
+    payload = json.loads((site / f"v1/checkpoints/{run}.sigstore.json").read_text())["signed"].encode()
+    return payload, json.loads(payload)
+
+
+def lookup(site: Path, run: int, digest: str) -> list[dict]:
+    _, cp = checkpoint(site, run)
+    shard = {s["name"]: s["digest"]["sha256"] for s in cp["subject"]}[digest[:2]]
+    body = (site / f"v1/shards/{shard}.json").read_bytes()
+    assert sha256(body) == shard
+    return json.loads(body).get(digest, [])
+
+
+def test_sign_publishes_the_receipt_by_digest_and_a_first_checkpoint(signing, tmp_path):
+    _, _, put = signing
+    put("org/clean", statement("org/clean"))
+    site = run_sign(signing, tmp_path, 0, ["org/clean"])
+    pointer = json.loads((site / f"v1/hf/org/clean/{SHA}.json").read_text())["receipt"]
+    stored = (site / f"v1/receipts/{pointer}.json").read_bytes()
+    assert sha256(stored) == pointer and json.loads(stored)["predicate"]["source"]["repo"] == "org/clean"
+    assert json.loads((site / "v1/head.json").read_text()) == {"checkpoint": 0}
+    _, cp = checkpoint(site, 0)
+    assert cp["predicateType"] == vs.CHECKPOINT_TYPE
+    assert [s["name"] for s in cp["subject"]] == [f"{i:02x}" for i in range(256)]
+    assert cp["predicate"]["run"] == 0 and cp["predicate"]["previous"] is None
+    [entry] = lookup(site, 0, LFS)
+    assert entry["receipt"] == pointer and entry["verdict"] == "clean"
+    assert (entry["repo"], entry["commit"], entry["name"]) == ("org/clean", SHA, "model.safetensors")
+
+
+def test_the_next_checkpoint_links_back_and_keeps_repos_not_rescanned(signing, tmp_path, monkeypatch):
+    _, _, put = signing
+    put("org/clean", statement("org/clean"))
+    first = run_sign(signing, tmp_path, 0, ["org/clean"])
+    monkeypatch.setattr(vs, "top_repos", lambda n: ["other/repo"])  # org/clean left the top list
+    put("other/repo", statement("other/repo"))
+    second = run_sign(signing, tmp_path, 1, ["other/repo"])
+    payload, _ = checkpoint(first, 0)
+    _, cp = checkpoint(second, 1)
+    assert cp["predicate"]["run"] == 1 and cp["predicate"]["previous"] == sha256(payload)
+    assert {e["repo"] for e in lookup(second, 1, LFS)} == {"org/clean", "other/repo"}
+
+
+def test_a_rescan_that_publishes_nothing_withdraws_the_old_entry(signing, tmp_path):
+    # org/clean scanned again and withheld (no receipt): its older verdict is not current.
+    _, _, put = signing
+    put("org/clean", statement("org/clean"))
+    run_sign(signing, tmp_path, 0, ["org/clean"])
+    (tmp_path / "out").mkdir()
+    second = run_sign(signing, tmp_path, 1, ["org/clean"])
+    assert lookup(second, 1, LFS) == []
+
+
+def test_an_entry_not_rescanned_drops_out_after_30_days():
+    now = datetime.now(timezone.utc)
+    old = {"repo": "a/b", "scanned": (now - timedelta(days=31)).isoformat()}
+    fresh = {"repo": "c/d", "scanned": (now - timedelta(days=29)).isoformat()}
+    old = {**old, "scanner": __version__}
+    fresh = {**fresh, "scanner": __version__}
+    assert vs.current({LFS: [old, fresh]}, set(), now, __version__) == {LFS: [fresh]}
+
+
+def test_an_entry_from_another_hayward_is_not_carried_forward():
+    # A release may add rules the old scan never ran; only a rescan puts it back.
+    now = datetime.now(timezone.utc)
+    entry = {"repo": "a/b", "scanned": now.isoformat(), "scanner": "0.0.1"}
+    assert vs.current({LFS: [entry]}, set(), now, __version__) == {}
+
+
+def test_sign_refuses_to_replace_a_published_checkpoint(signing, tmp_path):
+    _, _, put = signing
+    put("org/clean", statement("org/clean"))
+    run_sign(signing, tmp_path, 0, ["org/clean"])
+    # head.json rolled back, while checkpoint 0 stays published.
+    (tmp_path / "public" / "v1" / "head.json").unlink()
+    put("org/clean", statement("org/clean"))
+    with pytest.raises(SystemExit, match="already published"):
+        run_sign(signing, tmp_path, 1, ["org/clean"])
+
+
+def test_sign_refuses_when_the_published_checkpoint_does_not_verify(signing, tmp_path, monkeypatch):
+    _, _, put = signing
+    put("org/clean", statement("org/clean"))
+    run_sign(signing, tmp_path, 0, ["org/clean"])
+
+    def forged(raw, *pins):
+        raise receipt.SignatureError("not our signer")
+
+    monkeypatch.setattr(receipt, "_sigstore_open", forged)
+    put("org/clean", statement("org/clean"))
+    with pytest.raises(SystemExit, match="nothing signed"):
+        run_sign(signing, tmp_path, 1, ["org/clean"])
+    assert not (tmp_path / "site1").exists()
+
+
+def test_monitor_passes_an_intact_chain_and_flags_a_gap_or_an_edit(signing, tmp_path, capsys):
+    _, _, put = signing
+    for run in range(3):
+        put("org/clean", statement("org/clean"))
+        run_sign(signing, tmp_path, run, ["org/clean"])
+    assert vs.cmd_monitor(Namespace()) == 0
+    assert "3 checkpoint(s)" in capsys.readouterr().out
+    public = tmp_path / "public" / "v1" / "checkpoints"
+    edited = json.loads((public / "1.sigstore.json").read_text())
+    edited["signed"] = edited["signed"].replace('"run": 1', '"run": 1, "x": 1')
+    (public / "1.sigstore.json").write_text(json.dumps(edited))
+    assert vs.cmd_monitor(Namespace()) == 1
+    assert "checkpoint 1 is not the one checkpoint 2 names" in capsys.readouterr().out
+    (public / "1.sigstore.json").unlink()
+    assert vs.cmd_monitor(Namespace()) == 1
+    assert "checkpoint 1 is missing" in capsys.readouterr().out
+
+
+def test_monitor_remembers_digests_and_catches_a_rewrite_or_a_rollback(signing, tmp_path, capsys):
+    _, _, put = signing
+    for run in range(2):
+        put("org/clean", statement("org/clean"))
+        run_sign(signing, tmp_path, run, ["org/clean"])
+    known = tmp_path / "known.json"
+    assert vs.cmd_monitor(Namespace(known=str(known))) == 0
+    record = json.loads(known.read_text())
+    assert set(record) == {"0", "1"}
+    known.write_text(json.dumps({**record, "0": "f" * 64}))
+    assert vs.cmd_monitor(Namespace(known=str(known))) == 1
+    assert "checkpoint 0 changed since it was last seen" in capsys.readouterr().out
+    known.write_text(json.dumps({**record, "5": "f" * 64}))
+    assert vs.cmd_monitor(Namespace(known=str(known))) == 1
+    assert "head went back" in capsys.readouterr().out
+
+
+def test_monitor_rejects_a_head_that_names_no_checkpoint(signing, tmp_path, capsys):
+    public = tmp_path / "public" / "v1"
+    public.mkdir(parents=True)
+    for bad in ('{"checkpoint": "9"}', '{"checkpoint": true}', "[]", "nonsense"):
+        (public / "head.json").write_text(bad)
+        assert vs.cmd_monitor(Namespace()) == 1
+    assert "does not name a checkpoint" in capsys.readouterr().out
 
 
 # ---- deploy ------------------------------------------------------------------------------
@@ -321,6 +483,24 @@ def test_deploy_stops_if_a_kept_file_must_be_uploaded_again(hosting, monkeypatch
         vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
 
 
+def test_deploy_keeps_the_live_copy_of_a_content_named_file(hosting):
+    site, live, populated, uploaded = hosting
+    live["/v1/shards/abc.json"] = "1" * 64
+    (site / "v1" / "shards").mkdir(parents=True)
+    (site / "v1" / "shards" / "abc.json").write_text("{}")
+    vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
+    assert deployed(populated) == {"/v1/shards/abc.json": "1" * 64} and uploaded == []
+
+
+def test_deploy_never_replaces_a_published_checkpoint(hosting):
+    site, live, _, _ = hosting
+    live["/v1/checkpoints/0.sigstore.json"] = "1" * 64
+    (site / "v1" / "checkpoints").mkdir(parents=True)
+    (site / "v1" / "checkpoints" / "0.sigstore.json").write_text("{}")
+    with pytest.raises(SystemExit, match="replace a published checkpoint"):
+        vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
+
+
 def test_only_https_is_ever_requested():
     with pytest.raises(ValueError):
         vs._http("http://example.com")
@@ -330,7 +510,7 @@ def test_sign_refuses_a_repo_outside_the_scanned_list(signing):
     src, site, put = signing
     put("attacker/trojan", statement("attacker/trojan"))
     with pytest.raises(SystemExit):
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
     assert not site.exists()
 
 
@@ -348,7 +528,7 @@ def test_sign_refuses_a_receipt_that_does_not_have_the_expected_shape(signing, t
     tamper(st)
     put("org/clean", st)
     with pytest.raises(SystemExit):
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
     assert not site.exists()
 
 
@@ -357,7 +537,7 @@ def test_sign_signs_a_canonical_copy_not_the_scan_jobs_bytes(signing):
     st = statement("org/clean")
     st["predicate"]["extra"] = "ignored"
     put("org/clean", st)
-    vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+    vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
     signed = json.loads(json.loads((site / f"v1/hf/org/clean/{SHA}.sigstore.json").read_text())["signed"])
     assert "extra" not in signed["predicate"]
 
@@ -366,7 +546,7 @@ def test_a_refusal_never_names_the_repo(signing, capsys):
     src, site, put = signing
     put("evil/secret", statement("evil/secret", "flagged"))
     with pytest.raises(SystemExit) as exc:
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
     assert "evil" not in str(exc.value)
 
 
@@ -375,4 +555,4 @@ def test_sign_refuses_an_unexpected_file_in_the_artifact(signing, tmp_path):
     put("org/clean", statement("org/clean"))
     (src / "index.html").write_text("<script>")
     with pytest.raises(SystemExit):
-        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site)))
+        vs.cmd_sign(Namespace(top=100, src=str(src), site=str(site), scanned=str(src.parent / "scanned.json")))
