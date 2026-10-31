@@ -150,7 +150,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
         repos = top_repos(args.top)
         for index, repo in enumerate(repos):
             statement = scan_repo(repo, Path(tmp) / str(index))
-            if statement is None:
+            # No file to vouch for (only big GGUF files, only YAML): nothing to publish,
+            # and an empty receipt would make the sign job refuse the whole run.
+            if statement is None or not statement.get("subject"):
                 failed += 1
                 continue
             sha = statement["predicate"]["source"]["revision"]

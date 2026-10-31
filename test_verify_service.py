@@ -58,6 +58,20 @@ def test_scan_publishes_everything_but_flagged_repos(scanned, capsys):
     assert scanned_list == ["org/clean", "org/code", "evil/secret", "org/broken"]
 
 
+def test_a_repo_with_nothing_scannable_is_not_written(monkeypatch, tmp_path):
+    # e.g. only GGUF files over the size cap, or only YAML: the receipt lists no file.
+    # The sign job refuses an empty receipt and then signs nothing, so it must not get one.
+    empty = statement("org/empty")
+    empty["subject"], empty["predicate"]["files"] = [], {}
+    results = {"org/clean": statement("org/clean"), "org/empty": empty}
+    monkeypatch.setattr(vs, "top_repos", lambda n: list(results))
+    monkeypatch.setattr(vs, "scan_repo", lambda repo, work: results[repo])
+    monkeypatch.setattr(vs, "encrypt_for_review", lambda report, out: None)
+    out = tmp_path / "out"
+    vs.cmd_scan(Namespace(top=2, out=str(out)))
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*.json")] == [f"v1/hf/org/clean/{SHA}.intoto.json"]
+
+
 def test_scan_logs_never_name_a_withheld_repo(scanned, capsys):
     out, _ = scanned
     vs.cmd_scan(Namespace(top=4, out=str(out)))
