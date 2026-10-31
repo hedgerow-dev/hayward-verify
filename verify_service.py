@@ -1,13 +1,22 @@
 """The hayward-verify service: scan popular Hub models, sign the verdicts, publish them.
 
     python verify_service.py scan --top 100 --out out          (job 1: HF_TOKEN only)
-    python verify_service.py sign --top 100 out site            (job 2: OIDC identity only)
+    python verify_service.py sign --top 100 --scanned scanned.json out site
+                                                                (job 2: OIDC identity only)
     python verify_service.py deploy --top 100 --scanned scanned.json site
                                                                 (job 3: keyless Google login only)
+
+    python verify_service.py monitor                            (anyone: check the checkpoint chain)
 
 Each deploy keeps the verdicts already published, except those of repos this run
 scanned: for those, only what this run signed counts, so a rescan that withholds a
 repo also takes down its older verdicts.
+
+The verdict log (hayward docs/specs/verdict-log.md): each receipt is also published
+under its own SHA-256, and every file hash is indexed in one of 256 shards. Each run
+signs one checkpoint naming the shards and the previous checkpoint; a verdict is
+current while a checkpoint lists it. The sign job verifies the published checkpoint
+before it signs the next, and refuses to sign if it does not verify.
 
 Each step runs in its own job with only the credential it needs. Scanning handles
 untrusted model files, so it holds no signing or deploy credential; signing re-checks
@@ -47,6 +56,10 @@ ENTRY_KEYS = ("verdict", "rules", "coverage_gaps", "read", "hash_source")
 RULE_RE = re.compile(r"MFV-[A-Z0-9]+-[0-9]{3}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REPORT_BLOCK = 256 * 1024  # the withheld report is padded to a multiple of this
+CHECKPOINT_TYPE = "https://hedgerow.dev/hayward/checkpoint/v1"
+# A verdict not rescanned stays in the checkpoint this long after its scan: the same
+# limit the client puts on a per-repo bundle.
+KEEP_DAYS = 30
 
 GCP_PROJECT_NUMBER = "1036350257376"
 WIF_PROVIDER = (f"//iam.googleapis.com/projects/{GCP_PROJECT_NUMBER}/locations/global/"
@@ -263,11 +276,185 @@ def cmd_sign(args: argparse.Namespace) -> int:
         # A count only: a refused receipt means the scan job was compromised or broken,
         # and its path could name a withheld repo. Nothing is signed.
         raise SystemExit(f"refused {refused} receipt(s); nothing signed")
+    try:
+        previous = previous_checkpoint()
+    except (ValueError, KeyError, TypeError, receipt.SignatureError, urllib.error.URLError) as exc:
+        raise SystemExit(f"the published checkpoint does not verify ({exc}); nothing signed") from None
+    # Every repo this run scanned, from the scan job's list and today's: for those, only
+    # what this run signed is current, so a rescan that withholds a repo withdraws it.
+    rescanned = allowed | set(json.loads(Path(args.scanned).read_text(encoding="utf-8")))
+    entries = current(previous[2] if previous else {}, rescanned, now, __version__)
+    run = previous[0] + 1 if previous else 0
+    if fetch_public(f"v1/checkpoints/{run}.sigstore.json") is not None:
+        # head.json is behind what is published: signing would replace a checkpoint.
+        raise SystemExit(f"checkpoint {run} is already published; nothing signed")
     for repo, sha, statement in to_sign:
-        dest = site / "v1" / "hf" / repo / f"{sha}.sigstore.json"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(receipt._sigstore_sign((json.dumps(statement, indent=1) + "\n").encode()), encoding="utf-8")
-    print(f"signed {len(to_sign)} verdict(s)")
+        raw = (json.dumps(statement, indent=1) + "\n").encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        write(site / "v1" / "receipts" / f"{digest}.json", raw)
+        write(site / "v1" / "hf" / repo / f"{sha}.json", json.dumps({"receipt": digest}).encode())
+        write(site / "v1" / "hf" / repo / f"{sha}.sigstore.json", receipt._sigstore_sign(raw).encode())
+        predicate = statement["predicate"]
+        for subject in statement["subject"]:
+            name = subject["name"]
+            entries.setdefault(subject["digest"]["sha256"], []).append({
+                "receipt": digest, "repo": repo, "commit": sha, "name": name,
+                "scanned": predicate["scanned"], "scanner": predicate["scanner"]["version"],
+                **predicate["files"][name]})
+    subjects = []
+    for prefix, body in shards(entries).items():
+        shard = hashlib.sha256(body).hexdigest()
+        write(site / "v1" / "shards" / f"{shard}.json", body)
+        subjects.append({"name": prefix, "digest": {"sha256": shard}})
+    checkpoint = {
+        "_type": receipt.STATEMENT_TYPE,
+        "subject": subjects,
+        "predicateType": CHECKPOINT_TYPE,
+        "predicate": {"run": run, "previous": previous[1] if previous else None,
+                      "signed": now.isoformat(timespec="seconds"),
+                      "scanner": {"name": "hayward", "version": __version__}},
+    }
+    raw = (json.dumps(checkpoint, indent=1) + "\n").encode()
+    write(site / "v1" / "checkpoints" / f"{run}.sigstore.json", receipt._sigstore_sign(raw).encode())
+    write(site / "v1" / "head.json", json.dumps({"checkpoint": run}).encode())
+    print(f"signed {len(to_sign)} verdict(s) and checkpoint {run}")
+    return 0
+
+
+def write(path: Path, body: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+
+
+def fetch_public(path: str) -> bytes | None:
+    """A file from the published site, or None when it is not there."""
+    from hayward import verify
+
+    try:
+        return _http(f"{verify.SERVICE}/{path}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def open_checkpoint(raw: bytes) -> tuple[bytes, dict]:
+    """The signed payload and statement of a checkpoint bundle, or raise: it must be
+    signed by this service's own scheduled workflow, as the client requires."""
+    from hayward import receipt, verify
+
+    payload = receipt._sigstore_open(raw, verify.IDENTITY, verify.ISSUER, verify.TRIGGER,
+                                     verify.REPOSITORY_ID, verify.OWNER_ID)
+    statement = json.loads(payload)
+    if statement.get("_type") != receipt.STATEMENT_TYPE or statement.get("predicateType") != CHECKPOINT_TYPE:
+        raise ValueError("not a checkpoint")
+    return payload, statement
+
+
+def previous_checkpoint() -> tuple[int, str, dict[str, list[dict]]] | None:
+    """The run number, payload digest and entries of the published checkpoint, or None
+    before the first one. Raises if what is published does not verify."""
+    head = fetch_public("v1/head.json")
+    if head is None:
+        return None
+    run = json.loads(head)["checkpoint"]
+    if not valid_run(run):
+        raise ValueError("head.json does not name a checkpoint")
+    raw = fetch_public(f"v1/checkpoints/{run}.sigstore.json")
+    if raw is None:
+        raise ValueError("head.json names a missing checkpoint")
+    payload, statement = open_checkpoint(raw)
+    if statement["predicate"]["run"] != run:
+        raise ValueError("the checkpoint is not the one head.json names")
+    entries: dict[str, list[dict]] = {}
+    for shard in {s["digest"]["sha256"] for s in statement["subject"]}:
+        body = fetch_public(f"v1/shards/{shard}.json")
+        if body is None or hashlib.sha256(body).hexdigest() != shard:
+            raise ValueError("a shard does not match the checkpoint")
+        entries.update(json.loads(body))
+    return run, hashlib.sha256(payload).hexdigest(), entries
+
+
+def valid_run(run: object) -> bool:
+    return isinstance(run, int) and not isinstance(run, bool) and run >= 0
+
+
+def current(entries: dict[str, list[dict]], rescanned: set[str], now: datetime,
+            version: str) -> dict[str, list[dict]]:
+    """The entries that stay current: not of a repo scanned this run, scanned in the last
+    KEEP_DAYS days, and by this Hayward, so a release with new rules never vouches for a
+    verdict it did not reach."""
+    kept = {}
+    for digest, items in entries.items():
+        left = [e for e in items if e["repo"] not in rescanned and e["scanner"] == version
+                and now - datetime.fromisoformat(e["scanned"]) <= timedelta(days=KEEP_DAYS)]
+        if left:
+            kept[digest] = left
+    return kept
+
+
+def shards(entries: dict[str, list[dict]]) -> dict[str, bytes]:
+    """The 256 shard files, by the first two hex digits of the file hashes they hold."""
+    by_prefix: dict[str, dict] = {f"{i:02x}": {} for i in range(256)}
+    for digest, items in entries.items():
+        by_prefix[digest[:2]][digest] = sorted(items, key=lambda e: (e["repo"], e["commit"], e["name"]))
+    return {prefix: json.dumps(held, sort_keys=True, separators=(",", ":")).encode()
+            for prefix, held in by_prefix.items()}
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Walk the published checkpoints from head back to 0: each must verify, carry its
+    own run number, and be the one its successor names. Anyone can run this. With
+    --known FILE it also keeps each checkpoint's digest from earlier runs, so a chain
+    rewritten as a whole, or a head that went back, is caught too."""
+    from hayward import receipt
+
+    head = fetch_public("v1/head.json")
+    if head is None:
+        print("no checkpoint published")
+        return 1
+    try:
+        top = json.loads(head)["checkpoint"]
+    except (ValueError, KeyError, TypeError):
+        top = None
+    if not valid_run(top):
+        print("problem: head.json does not name a checkpoint")
+        return 1
+    known_path = Path(args.known) if getattr(args, "known", None) else None
+    known = json.loads(known_path.read_text(encoding="utf-8")) if known_path and known_path.is_file() else {}
+    problems, named = [], None  # named: the payload digest the later checkpoint expects
+    if any(int(run) > top for run in known):
+        problems.append(f"head went back to checkpoint {top}")
+    for run in range(top, -1, -1):
+        raw = fetch_public(f"v1/checkpoints/{run}.sigstore.json")
+        if raw is None:
+            problems.append(f"checkpoint {run} is missing")
+            named = None
+            continue
+        try:
+            payload, statement = open_checkpoint(raw)
+            predicate = statement["predicate"]
+            if predicate["run"] != run:
+                problems.append(f"checkpoint {run} says it is run {predicate['run']}")
+            if named is not None and hashlib.sha256(payload).hexdigest() != named:
+                problems.append(f"checkpoint {run} is not the one checkpoint {run + 1} names")
+            named = predicate["previous"]
+            digest = hashlib.sha256(payload).hexdigest()
+            if known.get(str(run), digest) != digest:
+                problems.append(f"checkpoint {run} changed since it was last seen")
+            known[str(run)] = digest
+            if run == 0 and named is not None:
+                problems.append("checkpoint 0 names a previous one")
+        except (ValueError, KeyError, TypeError, receipt.SignatureError) as exc:
+            problems.append(f"checkpoint {run} does not verify: {exc}")
+            named = None
+    for problem in problems:
+        print(f"problem: {problem}")
+    if problems:
+        return 1
+    if known_path:
+        known_path.write_text(json.dumps(known, indent=1, sort_keys=True), encoding="utf-8")
+    print(f"chain intact: {top + 1} checkpoint(s)")
     return 0
 
 
@@ -334,6 +521,11 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     rescanned |= set(top_repos(args.top + TOP_SLACK))
     token = google_token()
     keep = carried(live_files(token), rescanned)
+    for path in [p for p in files if p in keep]:
+        if path.startswith(("/v1/receipts/", "/v1/shards/")):
+            del files[path]  # named by its content, so the live copy is the same file
+        elif path.startswith("/v1/checkpoints/"):
+            raise SystemExit("this run would replace a published checkpoint; nothing released")
     version = _json(f"{HOSTING}/sites/{SITE}/versions", {"config": {"headers": [
         {"glob": "**", "headers": {"Cache-Control": "max-age=300", "X-Content-Type-Options": "nosniff",
                                    "Access-Control-Allow-Origin": "*"}}]}}, token=token)["name"]
@@ -363,14 +555,17 @@ def main(argv: list[str] | None = None) -> int:
     scan.add_argument("--out", required=True)
     sign = sub.add_parser("sign")
     sign.add_argument("--top", type=int, default=100)
+    sign.add_argument("--scanned", required=True, help="scanned.json from the scan job")
     sign.add_argument("src")
     sign.add_argument("site")
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--top", type=int, default=100)
     deploy.add_argument("--scanned", required=True, help="scanned.json from the scan job")
     deploy.add_argument("site")
+    monitor = sub.add_parser("monitor", help="check the published checkpoint chain")
+    monitor.add_argument("--known", help="a file of checkpoint digests seen before, kept up to date")
     args = parser.parse_args(argv)
-    return {"scan": cmd_scan, "sign": cmd_sign, "deploy": cmd_deploy}[args.command](args)
+    return {"scan": cmd_scan, "sign": cmd_sign, "deploy": cmd_deploy, "monitor": cmd_monitor}[args.command](args)
 
 
 if __name__ == "__main__":
