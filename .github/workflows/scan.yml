@@ -44,6 +44,13 @@ jobs:
           path: out
           retention-days: 3
           if-no-files-found: error
+      # The public top-N list this run scanned, so deploy drops their older verdicts.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scanned
+          path: scanned.json
+          retention-days: 3
+          if-no-files-found: error
       # age-encrypted to the reviewer's key, so safe in a public repo's artifacts.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -73,7 +80,7 @@ jobs:
         with:
           name: receipts
           path: out
-      - run: python verify_service.py sign out site
+      - run: python verify_service.py sign --top 100 out site
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: site
@@ -101,4 +108,8 @@ jobs:
         with:
           name: site
           path: site
-      - run: python verify_service.py deploy site
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: scanned
+          path: .
+      - run: python verify_service.py deploy --top 100 --scanned scanned.json site

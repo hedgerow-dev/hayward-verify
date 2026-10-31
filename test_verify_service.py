@@ -52,6 +52,8 @@ def test_scan_publishes_everything_but_flagged_repos(scanned, capsys):
     written = sorted(p.relative_to(out).as_posix() for p in out.rglob("*.json"))
     assert written == [f"v1/hf/org/clean/{SHA}.intoto.json", f"v1/hf/org/code/{SHA}.intoto.json"]
     assert [w["repo"] for w in encrypted["report"]] == ["evil/secret"]
+    scanned_list = json.loads((out.parent / "scanned.json").read_text())
+    assert scanned_list == ["org/clean", "org/code", "evil/secret", "org/broken"]
 
 
 def test_scan_logs_never_name_a_withheld_repo(scanned, capsys):
@@ -171,6 +173,8 @@ def test_site_files_are_gzipped_under_their_url_paths(tmp_path):
 
 def test_deploy_never_prints_a_token(monkeypatch, tmp_path, capsys):
     (tmp_path / "a.json").write_text("{}")
+    (tmp_path / "scanned.json").write_text("[]")
+    monkeypatch.setattr(vs, "top_repos", lambda n: [])
     monkeypatch.setattr(vs, "google_token", lambda: "SECRET-TOKEN")
     calls = []
 
@@ -185,9 +189,136 @@ def test_deploy_never_prints_a_token(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(vs, "_json", fake_json)
     monkeypatch.setattr(vs, "_http", lambda *a, **k: b"")
-    assert vs.cmd_deploy(Namespace(site=str(tmp_path))) == 0
+    assert vs.cmd_deploy(Namespace(site=str(tmp_path), top=100, scanned=str(tmp_path / "scanned.json"))) == 0
     assert "SECRET-TOKEN" not in capsys.readouterr().out
     assert any("releases" in c for c in calls)
+
+
+def gz_hash(body: bytes) -> str:
+    return vs.hashlib.sha256(gzip.compress(body, mtime=0)).hexdigest()
+
+
+@pytest.fixture
+def hosting(monkeypatch, tmp_path):
+    """A fake Hosting API whose live version holds ``live`` (path -> hash), served in
+    pages of two. Returns (site dir, live, populated batches, uploaded hashes)."""
+    live: dict[str, str] = {}
+    populated: list[dict] = []
+    uploaded: list[str] = []
+    monkeypatch.setattr(vs, "google_token", lambda: "t")
+    monkeypatch.setattr(vs, "top_repos", lambda n: ["org/top"])
+    (tmp_path / "scanned.json").write_text(json.dumps(["org/top"]))
+    site = tmp_path / "site"
+    site.mkdir()
+
+    def fake_json(url, body=None, token=None, method=None):
+        if url.endswith("/channels/live"):
+            return {"release": {"version": {"name": "sites/s/versions/old"}}} if live else {}
+        if "/versions/old/files?" in url:
+            paths = sorted(live)
+            start = int(url.split("pageToken=")[1]) if "pageToken=" in url else 0
+            page = {"files": [{"path": p, "hash": live[p], "status": "uploaded"} for p in paths[start:start + 2]]}
+            if start + 2 < len(paths):
+                page["nextPageToken"] = str(start + 2)
+            return page
+        if url.endswith("/versions"):
+            return {"name": "sites/s/versions/new"}
+        if url.endswith(":populateFiles"):
+            populated.append(body["files"])
+            return {"uploadRequiredHashes": [h for h in body["files"].values() if h not in live.values()],
+                    "uploadUrl": "https://upload-firebasehosting.googleapis.com/upload/x"}
+        return {}
+
+    def fake_http(url, data=None, headers=None, method=None):
+        uploaded.append(url.rsplit("/", 1)[1])
+        return b""
+
+    monkeypatch.setattr(vs, "_json", fake_json)
+    monkeypatch.setattr(vs, "_http", fake_http)
+    return site, live, populated, uploaded
+
+
+def deployed(populated: list[dict]) -> dict[str, str]:
+    return {path: digest for batch in populated for path, digest in batch.items()}
+
+
+def test_deploy_keeps_earlier_verdicts_without_uploading_them(hosting):
+    site, live, populated, uploaded = hosting
+    live.update({"/v1/hf/gone/repo/1.sigstore.json": "1" * 64, "/v1/hf/gone/repo/2.sigstore.json": "2" * 64,
+                 "/v1/hf/gone/other/3.sigstore.json": "3" * 64})
+    (site / "new.json").write_text("{}")
+    assert vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json"))) == 0
+    assert deployed(populated) == {**live, "/new.json": gz_hash(b"{}")}
+    assert uploaded == [gz_hash(b"{}")]
+
+
+def test_deploy_drops_old_verdicts_of_a_repo_scanned_this_run(hosting):
+    # A repo in this run's list was rescanned: only what this run signed counts, so an
+    # older clean verdict cannot outlive a scan that withheld the repo.
+    site, live, populated, _ = hosting
+    live.update({"/v1/hf/org/top/old.sigstore.json": "1" * 64, "/v1/hf/gone/repo/x.sigstore.json": "2" * 64})
+    (site / "keep.json").write_text("{}")
+    vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
+    assert "/v1/hf/org/top/old.sigstore.json" not in deployed(populated)
+    assert "/v1/hf/gone/repo/x.sigstore.json" in deployed(populated)
+
+
+def test_a_new_file_replaces_the_old_one_at_its_path(hosting):
+    site, live, populated, _ = hosting
+    live["/v1/hf/gone/repo/x.sigstore.json"] = "1" * 64
+    (site / "v1" / "hf" / "gone" / "repo").mkdir(parents=True)
+    (site / "v1" / "hf" / "gone" / "repo" / "x.sigstore.json").write_text("new")
+    vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
+    assert deployed(populated)["/v1/hf/gone/repo/x.sigstore.json"] == gz_hash(b"new")
+
+
+def test_the_first_deploy_has_nothing_to_carry(hosting):
+    site, _, populated, _ = hosting
+    (site / "a.json").write_text("{}")
+    assert vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json"))) == 0
+    assert deployed(populated) == {"/a.json": gz_hash(b"{}")}
+
+
+def test_files_are_populated_in_batches_of_at_most_1000(hosting, monkeypatch):
+    site, live, populated, _ = hosting
+    for i in range(2500):
+        live[f"/v1/hf/gone/repo/{i}.sigstore.json"] = f"{i:064x}"
+    (site / "a.json").write_text("{}")
+    vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
+    assert max(len(batch) for batch in populated) <= 1000 and len(deployed(populated)) == 2501
+
+
+def test_a_repo_scanned_this_run_is_dropped_even_after_leaving_the_top_list(hosting):
+    # Scanned (and maybe withheld) hours ago, out of the top list by deploy time.
+    site, live, populated, _ = hosting
+    (site.parent / "scanned.json").write_text(json.dumps(["org/top", "org/slipped"]))
+    live.update({"/v1/hf/org/slipped/old.sigstore.json": "1" * 64, "/v1/hf/org/top2/x.sigstore.json": "2" * 64})
+    (site / "a.json").write_text("{}")
+    vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
+    # org/top2 shares a prefix with org/top but was not scanned, so it is kept.
+    assert set(deployed(populated)) == {"/a.json", "/v1/hf/org/top2/x.sigstore.json"}
+
+
+def test_a_live_release_without_a_version_carries_nothing(monkeypatch):
+    monkeypatch.setattr(vs, "_json", lambda url, body=None, token=None, method=None: {"release": {"name": "r"}})
+    assert vs.live_files("t") == {}
+
+
+def test_deploy_stops_if_a_kept_file_must_be_uploaded_again(hosting, monkeypatch):
+    site, live, _, _ = hosting
+    live["/v1/hf/gone/repo/x.sigstore.json"] = "1" * 64
+    (site / "a.json").write_text("{}")
+    fake = vs._json
+
+    def forgetful(url, body=None, token=None, method=None):
+        result = fake(url, body, token, method)
+        if url.endswith(":populateFiles"):
+            result["uploadRequiredHashes"] = list(body["files"].values())
+        return result
+
+    monkeypatch.setattr(vs, "_json", forgetful)
+    with pytest.raises(SystemExit, match="nothing released"):
+        vs.cmd_deploy(Namespace(site=str(site), top=100, scanned=str(site.parent / "scanned.json")))
 
 
 def test_only_https_is_ever_requested():
