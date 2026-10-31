@@ -1,11 +1,13 @@
 name: Scan, sign, publish
 
-# Weekly. Only this scheduled run can sign (the client requires the `schedule`
+# Every 6 hours, so a new commit to a popular model has a verdict within hours. More
+# often would mostly re-sign unchanged repos into Sigstore's public log. Only this
+# scheduled run can sign (the client requires the `schedule`
 # trigger in the signing certificate) or deploy (the Google provider accepts only
 # this workflow, on main, from a schedule). A manual or PR run can do neither.
 on:
   schedule:
-    - cron: "17 3 * * 1"
+    - cron: "17 */6 * * *"
 
 permissions: {}
 
