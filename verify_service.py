@@ -1,8 +1,13 @@
 """The hayward-verify service: scan popular Hub models, sign the verdicts, publish them.
 
     python verify_service.py scan --top 100 --out out          (job 1: HF_TOKEN only)
-    python verify_service.py sign out site                      (job 2: OIDC identity only)
-    python verify_service.py deploy site                        (job 3: keyless Google login only)
+    python verify_service.py sign --top 100 out site            (job 2: OIDC identity only)
+    python verify_service.py deploy --top 100 --scanned scanned.json site
+                                                                (job 3: keyless Google login only)
+
+Each deploy keeps the verdicts already published, except those of repos this run
+scanned: for those, only what this run signed counts, so a rescan that withholds a
+repo also takes down its older verdicts.
 
 Each step runs in its own job with only the credential it needs. Scanning handles
 untrusted model files, so it holds no signing or deploy credential; signing re-checks
@@ -49,6 +54,7 @@ WIF_PROVIDER = (f"//iam.googleapis.com/projects/{GCP_PROJECT_NUMBER}/locations/g
 DEPLOY_ACCOUNT = "verify-deploy@hedgerow-verify.iam.gserviceaccount.com"
 SITE = "hedgerow-verify"
 HOSTING = "https://firebasehosting.googleapis.com/v1beta1"
+POPULATE_BATCH = 1000  # file hashes per populateFiles request, the limit Firebase's deploy guide gives
 
 
 def _http(url: str, data: bytes | None = None, headers: dict | None = None, method: str | None = None) -> bytes:
@@ -126,7 +132,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     out = Path(args.out)
     published, withheld, failed = 0, [], 0
     with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
-        for index, repo in enumerate(top_repos(args.top)):
+        repos = top_repos(args.top)
+        for index, repo in enumerate(repos):
             statement = scan_repo(repo, Path(tmp) / str(index))
             if statement is None:
                 failed += 1
@@ -142,6 +149,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # Always written, and padded, so neither its presence nor its size says whether
     # anything was withheld.
     encrypt_for_review(withheld, out.parent / "withheld.json.age")
+    # Every repo this run scanned, withheld or not: deploy drops their older verdicts.
+    # The same public top-N list, so it names nothing the site does not.
+    (out.parent / "scanned.json").write_text(json.dumps(repos), encoding="utf-8")
     # The total only: a split into published, withheld and failed, set against the
     # public site and the public top-N list, would name the withheld repos.
     print(f"scanned {published + len(withheld) + failed} repo(s)")
@@ -290,21 +300,58 @@ def site_files(site: Path) -> dict[str, bytes]:
     return files
 
 
+def live_files(token: str) -> dict[str, str]:
+    """Path -> hash of every file the site serves now; empty before the first release."""
+    release = _json(f"{HOSTING}/sites/{SITE}/channels/live", token=token).get("release") or {}
+    version = (release.get("version") or {}).get("name")
+    files, page = {}, ""
+    while version:
+        listing = _json(f"{HOSTING}/{version}/files?status=ACTIVE&pageSize=1000"
+                        + (f"&pageToken={urllib.parse.quote(page)}" if page else ""), token=token)
+        files.update({f["path"]: f["hash"] for f in listing.get("files", [])})
+        page = listing.get("nextPageToken")
+        if not page:
+            break
+    return files
+
+
+def carried(live: dict[str, str], rescanned: set[str]) -> dict[str, str]:
+    """The live files to keep: all but the verdicts of repos in this run's list. A repo
+    in the list was scanned again, so only what this run signed counts for it, and an
+    older verdict cannot outlive a scan that withheld the repo."""
+    def repo(path: str) -> str | None:
+        parts = path.split("/")
+        return "/".join(parts[3:5]) if parts[1:3] == ["v1", "hf"] and len(parts) > 5 else None
+    return {path: digest for path, digest in live.items() if repo(path) not in rescanned}
+
+
 def cmd_deploy(args: argparse.Namespace) -> int:
     files = site_files(Path(args.site))
+    # The scan job's own list, plus today's with the sign job's slack in case the scan
+    # list is missing a name: dropping a repo it did not scan only removes a verdict,
+    # never keeps one.
+    rescanned = set(json.loads(Path(args.scanned).read_text(encoding="utf-8")))
+    rescanned |= set(top_repos(args.top + TOP_SLACK))
     token = google_token()
+    keep = carried(live_files(token), rescanned)
     version = _json(f"{HOSTING}/sites/{SITE}/versions", {"config": {"headers": [
         {"glob": "**", "headers": {"Cache-Control": "max-age=300", "X-Content-Type-Options": "nosniff",
                                    "Access-Control-Allow-Origin": "*"}}]}}, token=token)["name"]
     by_hash = {hashlib.sha256(body).hexdigest(): body for body in files.values()}
-    populated = _json(f"{HOSTING}/{version}:populateFiles",
-                      {"files": {path: hashlib.sha256(body).hexdigest() for path, body in files.items()}}, token=token)
-    for digest in populated.get("uploadRequiredHashes", []):
-        _http(f"{populated['uploadUrl']}/{digest}", by_hash[digest],
-              {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}, "POST")
+    wanted = {**keep, **{path: hashlib.sha256(body).hexdigest() for path, body in files.items()}}
+    paths = sorted(wanted)
+    for start in range(0, len(paths), POPULATE_BATCH):
+        batch = {path: wanted[path] for path in paths[start:start + POPULATE_BATCH]}
+        populated = _json(f"{HOSTING}/{version}:populateFiles", {"files": batch}, token=token)
+        # Carried files are already on the site, so only this run's files can be asked for.
+        for digest in populated.get("uploadRequiredHashes", []):
+            if digest not in by_hash:
+                raise SystemExit("Hosting asked to re-upload a kept file; nothing released")
+            _http(f"{populated['uploadUrl']}/{digest}", by_hash[digest],
+                  {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}, "POST")
     _json(f"{HOSTING}/{version}?update_mask=status", {"status": "FINALIZED"}, token=token, method="PATCH")
     _json(f"{HOSTING}/sites/{SITE}/releases?versionName={urllib.parse.quote(version, safe='/')}", {}, token=token)
-    print(f"deployed {len(files)} file(s)")
+    print(f"deployed {len(files)} new file(s), kept {len(keep)}")
     return 0
 
 
@@ -319,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     sign.add_argument("src")
     sign.add_argument("site")
     deploy = sub.add_parser("deploy")
+    deploy.add_argument("--top", type=int, default=100)
+    deploy.add_argument("--scanned", required=True, help="scanned.json from the scan job")
     deploy.add_argument("site")
     args = parser.parse_args(argv)
     return {"scan": cmd_scan, "sign": cmd_sign, "deploy": cmd_deploy}[args.command](args)
