@@ -56,6 +56,8 @@ ENTRY_KEYS = ("verdict", "rules", "coverage_gaps", "read", "hash_source")
 RULE_RE = re.compile(r"MFV-[A-Z0-9]+-[0-9]{3}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 REPORT_BLOCK = 256 * 1024  # the withheld report is padded to a multiple of this
+NEW_SLACK = timedelta(minutes=30)  # runs overlap by this much, so a late run misses nothing
+PER_OWNER_CAP = 20  # new repos per uploader per run
 CHECKPOINT_TYPE = "https://hedgerow.dev/hayward/checkpoint/v1"
 # A verdict not rescanned stays in the checkpoint this long after its scan: the same
 # limit the client puts on a per-repo bundle.
@@ -91,6 +93,60 @@ def _json(url: str, body: dict | None = None, token: str | None = None, method: 
 def top_repos(count: int) -> list[str]:
     models = _json(f"{HUB}/api/models?sort=downloads&direction=-1&limit={count}")
     return [str(m["id"]) for m in models if isinstance(m, dict) and "id" in m]
+
+
+def _page(url: str) -> tuple[bytes, str | None]:
+    """One page of a Hub listing and the URL of the next, from its Link header."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("refusing a non-https URL")
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:  # noqa: S310 - https checked
+        body = resp.read()
+        link = resp.headers.get("Link", "")
+    nxt = next((part.split(";")[0].strip(" <>") for part in link.split(",") if 'rel="next"' in part), None)
+    if nxt is not None and not nxt.startswith(f"{HUB}/api/models?"):
+        raise ValueError("the Hub's next page is not a model listing")
+    return body, nxt
+
+
+def new_repos(hours: float, now: datetime) -> list[str]:
+    """Public, ungated model repos changed in the last ``hours`` (plus slack, so runs
+    overlap) that hold a file Hayward scans, newest first. One listing page carries each
+    repo's file list, so a 6-hour window costs a few API calls, not one per repo."""
+    from hayward import hub
+
+    suffixes = hub._scannable_suffixes()
+    since = now - timedelta(hours=hours) - NEW_SLACK
+    query = urllib.parse.urlencode([("sort", "lastModified"), ("direction", "-1"), ("limit", "1000"),
+                                    ("expand[]", "lastModified"), ("expand[]", "siblings"),
+                                    ("expand[]", "gated"), ("expand[]", "private")])
+    url: str | None = f"{HUB}/api/models?{query}"
+    repos: list[str] = []
+    per_owner: dict[str, int] = {}
+    while url:
+        body, url = _page(url)
+        for m in json.loads(body):
+            when = datetime.fromisoformat(str(m.get("lastModified", "")).replace("Z", "+00:00"))
+            if when < since:
+                return repos
+            repo = str(m.get("id", ""))
+            owner = repo.split("/", 1)[0]
+            if (not hub.REPO_RE.fullmatch(repo) or m.get("private") or m.get("gated")
+                    or not any(hub._wanted(str(f.get("rfilename", "")), suffixes) for f in m.get("siblings", []))):
+                continue
+            # One uploader cannot flood the queue: the rest of its repos wait for a later run.
+            if per_owner.get(owner, 0) >= PER_OWNER_CAP:
+                continue
+            per_owner[owner] = per_owner.get(owner, 0) + 1
+            repos.append(repo)
+    return repos
+
+
+def shard_of(repos: list[str], shard: str) -> list[str]:
+    """Shard ``i/n`` of ``repos``: every n-th one from the i-th."""
+    index, _, count = shard.partition("/")
+    if not (index.isdigit() and count.isdigit() and int(index) < int(count)):
+        raise ValueError(f"--shard must be i/n with 0 <= i < n, not {shard!r}")
+    return repos[int(index)::int(count)]
 
 
 def scan_repo(repo: str, work: Path) -> dict | None:
@@ -147,7 +203,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
     out = Path(args.out)
     published, withheld, failed = 0, [], 0
     with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
-        repos = top_repos(args.top)
+        if getattr(args, "repos", None):
+            repos = shard_of(json.loads(Path(args.repos).read_text(encoding="utf-8")), args.shard or "0/1")
+        else:
+            repos = top_repos(args.top)
         for index, repo in enumerate(repos):
             statement = scan_repo(repo, Path(tmp) / str(index))
             # No file to vouch for (only big GGUF files, only YAML): nothing to publish,
@@ -172,6 +231,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # The total only: a split into published, withheld and failed, set against the
     # public site and the public top-N list, would name the withheld repos.
     print(f"scanned {published + len(withheld) + failed} repo(s)")
+    return 0
+
+
+def cmd_list_new(args: argparse.Namespace) -> int:
+    repos = new_repos(args.hours, datetime.now(timezone.utc))
+    Path(args.out).write_text(json.dumps(repos), encoding="utf-8")
+    print(f"listed {len(repos)} repo(s) changed in the last {args.hours:g} hour(s)")
     return 0
 
 
@@ -556,12 +622,17 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     scan = sub.add_parser("scan")
     scan.add_argument("--top", type=int, default=100)
+    scan.add_argument("--repos", help="a JSON list of repos to scan instead of the top list")
+    scan.add_argument("--shard", help="with --repos, scan only shard i/n of it")
     scan.add_argument("--out", required=True)
     sign = sub.add_parser("sign")
     sign.add_argument("--top", type=int, default=100)
     sign.add_argument("--scanned", required=True, help="scanned.json from the scan job")
     sign.add_argument("src")
     sign.add_argument("site")
+    list_new = sub.add_parser("list-new", help="list repos changed on the Hub in the last HOURS")
+    list_new.add_argument("--hours", type=float, default=6)
+    list_new.add_argument("--out", required=True)
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--top", type=int, default=100)
     deploy.add_argument("--scanned", required=True, help="scanned.json from the scan job")
@@ -569,7 +640,8 @@ def main(argv: list[str] | None = None) -> int:
     monitor = sub.add_parser("monitor", help="check the published checkpoint chain")
     monitor.add_argument("--known", help="a file of checkpoint digests seen before, kept up to date")
     args = parser.parse_args(argv)
-    return {"scan": cmd_scan, "sign": cmd_sign, "deploy": cmd_deploy, "monitor": cmd_monitor}[args.command](args)
+    return {"scan": cmd_scan, "list-new": cmd_list_new, "sign": cmd_sign, "deploy": cmd_deploy,
+            "monitor": cmd_monitor}[args.command](args)
 
 
 if __name__ == "__main__":

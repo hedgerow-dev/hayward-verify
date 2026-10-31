@@ -1,0 +1,76 @@
+name: New uploads (dry run)
+
+# Every 6 hours, scan the model repos changed on the Hub since the last run, in 8
+# shards. A dry run: nothing is signed or published. It measures how long a run takes
+# and whether the Hub's rate limits hold, before new uploads join the verdict log.
+# Flagged repos go only into the age-encrypted review report, as in the main scan.
+on:
+  schedule:
+    - cron: "47 */6 * * *"
+
+permissions: {}
+
+concurrency:
+  group: new-uploads
+  cancel-in-progress: false
+
+jobs:
+  # Two listing calls to the Hub API; no secrets.
+  list:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --require-hashes --no-deps -r requirements.txt
+      - run: python verify_service.py list-new --hours 6 --out new.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: new-list
+          path: new.json
+          retention-days: 3
+          if-no-files-found: error
+
+  # Reads untrusted model files, so it holds only the read-only Hugging Face token, in
+  # the same locked-down per-repo containers as the main scan.
+  scan:
+    needs: list
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: docker build --pull -t hayward-verify-scanner:local .
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends age
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: new-list
+          path: .
+      - name: Scan this shard
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SHARD: ${{ matrix.shard }}
+        run: python verify_service.py scan --repos new.json --shard "$SHARD/8" --out out
+      # age-encrypted to the reviewer's key, so safe in a public repo's artifacts.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: withheld-${{ matrix.shard }}
+          path: withheld.json.age
+          retention-days: 30
+          if-no-files-found: error
