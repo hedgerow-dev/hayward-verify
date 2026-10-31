@@ -117,4 +117,6 @@ jobs:
         with:
           name: scanned
           path: .
+      # The home page, from this repo: it says what the service is and how to check.
+      - run: cp index.html site/index.html
       - run: python verify_service.py deploy --top 100 --scanned scanned.json site
