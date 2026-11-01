@@ -43,7 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HUB = "https://huggingface.co"
@@ -55,6 +55,9 @@ PUBLISHABLE = frozenset({"clean", "not_verified", "remote_code"})
 ENTRY_KEYS = ("verdict", "rules", "coverage_gaps", "read", "hash_source")
 RULE_RE = re.compile(r"MFV-[A-Z0-9]+-[0-9]{3}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+# hayward.hub's patterns, copied: deploy installs no packages.
+REPO_RE = re.compile(r"\w[\w.-]{0,95}/\w[\w.-]{0,95}")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 REPORT_BLOCK = 256 * 1024  # the withheld report is padded to a multiple of this
 NEW_SLACK = timedelta(minutes=30)  # runs overlap by this much, so a late run misses nothing
 PER_OWNER_CAP = 20  # new repos per uploader scanned before everyone else's are
@@ -63,6 +66,8 @@ CHECKPOINT_TYPE = "https://hedgerow.dev/hayward/checkpoint/v1"
 # A verdict not rescanned stays in the checkpoint this long after its scan: the same
 # limit the client puts on a per-repo bundle.
 KEEP_DAYS = 30
+# Days from reporting a confirmed repo to Hugging Face until the checkpoint names it withheld.
+WITHHELD_DAYS = 30
 
 GCP_PROJECT_NUMBER = "1036350257376"
 WIF_PROVIDER = (f"//iam.googleapis.com/projects/{GCP_PROJECT_NUMBER}/locations/global/"
@@ -214,10 +219,35 @@ def encrypt_for_review(report: list[dict], out: Path) -> None:
                    check=True)
 
 
+def confirmed_withheld() -> list[dict]:
+    """The WITHHELD secret: repo commits review confirmed as malicious, as a JSON list of
+    {repo, commit, reported}, `reported` a UTC date. Scan, sign and deploy all read it, so
+    a listed commit appears in no artifact and is vouched for nowhere. Errors never quote
+    it: until its window ends an entry is private."""
+    try:
+        raw = os.environ.get("WITHHELD", "")
+        items = json.loads(raw) if raw.strip() else []
+        if not isinstance(items, list):
+            raise ValueError
+        for item in items:
+            if not (isinstance(item, dict) and all(isinstance(item.get(k), str) for k in ("repo", "commit", "reported"))
+                    and REPO_RE.fullmatch(item["repo"]) and COMMIT_RE.fullmatch(item["commit"])):
+                raise ValueError
+            date.fromisoformat(item["reported"])
+    except (ValueError, RecursionError):
+        raise SystemExit("the WITHHELD secret is not a list of {repo, commit, reported}; stopping") from None
+    return items
+
+
+def blocked_commits() -> set[tuple[str, str]]:
+    return {(w["repo"], w["commit"]) for w in confirmed_withheld()}
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     out = Path(args.out)
     report = out.parent / "withheld.json.age"
     published, withheld, failed = 0, [], 0
+    blocked = blocked_commits()
     # Always written, and padded, so neither its presence nor its size says whether
     # anything was withheld. Written first and again on each finding, so a run cut
     # short by a timeout still leaves what it found for review.
@@ -237,6 +267,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 failed += 1
                 continue
             sha = statement["predicate"]["source"]["revision"]
+            if (repo, sha) in blocked:
+                # Confirmed in review: no receipt, so the public artifact cannot name it.
+                failed += 1
+                continue
             if "flagged" in verdicts(statement):
                 withheld.append({"repo": repo, "revision": sha, "files": statement["predicate"]["files"]})
                 encrypt_for_review(withheld, report)
@@ -346,6 +380,11 @@ def cmd_sign(args: argparse.Namespace) -> int:
     allowed = set(top_repos(args.top + TOP_SLACK))
     now = datetime.now(timezone.utc)
     to_sign, refused = [], 0
+    withheld = confirmed_withheld()
+    # Never vouched for, inside its window or not; named in public only after it.
+    blocked = blocked_commits()
+    due = sorted({(w["repo"], w["commit"]) for w in withheld
+                  if now.date() - date.fromisoformat(w["reported"]) >= timedelta(days=WITHHELD_DAYS)})
     for path in sorted(src.rglob("*")):
         if not path.is_file():
             continue
@@ -361,7 +400,8 @@ def cmd_sign(args: argparse.Namespace) -> int:
         except (ValueError, KeyError, TypeError, AttributeError):
             refused += 1
             continue
-        to_sign.append((repo, sha, statement))
+        if (repo, sha) not in blocked:
+            to_sign.append((repo, sha, statement))
     if refused:
         # A count only: a refused receipt means the scan job was compromised or broken,
         # and its path could name a withheld repo. Nothing is signed.
@@ -374,6 +414,8 @@ def cmd_sign(args: argparse.Namespace) -> int:
     # what this run signed is current, so a rescan that withholds a repo withdraws it.
     rescanned = allowed | set(json.loads(Path(args.scanned).read_text(encoding="utf-8")))
     entries = current(previous[2] if previous else {}, rescanned, now, __version__)
+    entries = {digest: left for digest, items in entries.items()
+               if (left := [e for e in items if (e["repo"], e["commit"]) not in blocked])}
     run = previous[0] + 1 if previous else 0
     if fetch_public(f"v1/checkpoints/{run}.sigstore.json") is not None:
         # head.json is behind what is published: signing would replace a checkpoint.
@@ -402,6 +444,7 @@ def cmd_sign(args: argparse.Namespace) -> int:
         "predicateType": CHECKPOINT_TYPE,
         "predicate": {"run": run, "previous": previous[1] if previous else None,
                       "signed": now.isoformat(timespec="seconds"),
+                      "withheld": [{"repo": repo, "commit": sha} for repo, sha in due],
                       "scanner": {"name": "hayward", "version": __version__}},
     }
     raw = (json.dumps(checkpoint, indent=1) + "\n").encode()
@@ -592,14 +635,19 @@ def live_files(token: str) -> dict[str, str]:
     return files
 
 
-def carried(live: dict[str, str], rescanned: set[str]) -> dict[str, str]:
-    """The live files to keep: all but the verdicts of repos in this run's list. A repo
-    in the list was scanned again, so only what this run signed counts for it, and an
-    older verdict cannot outlive a scan that withheld the repo."""
-    def repo(path: str) -> str | None:
+def carried(live: dict[str, str], rescanned: set[str],
+            blocked: set[tuple[str, str]] = frozenset()) -> dict[str, str]:
+    """The live files to keep: all but the verdicts of repos in this run's list, and of
+    commits confirmed in review. A repo in the list was scanned again, so only what this
+    run signed counts for it, and an older verdict cannot outlive a scan that withheld
+    the repo."""
+    def dropped(path: str) -> bool:
         parts = path.split("/")
-        return "/".join(parts[3:5]) if parts[1:3] == ["v1", "hf"] and len(parts) > 5 else None
-    return {path: digest for path, digest in live.items() if repo(path) not in rescanned}
+        if parts[1:3] != ["v1", "hf"] or len(parts) <= 5:
+            return False
+        repo = "/".join(parts[3:5])
+        return repo in rescanned or (repo, parts[5].split(".", 1)[0]) in blocked
+    return {path: digest for path, digest in live.items() if not dropped(path)}
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
@@ -610,7 +658,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     rescanned = set(json.loads(Path(args.scanned).read_text(encoding="utf-8")))
     rescanned |= set(top_repos(args.top + TOP_SLACK))
     token = google_token()
-    keep = carried(live_files(token), rescanned)
+    keep = carried(live_files(token), rescanned, blocked_commits())
     for path in [p for p in files if p in keep]:
         if path.startswith(("/v1/receipts/", "/v1/shards/")):
             del files[path]  # named by its content, so the live copy is the same file

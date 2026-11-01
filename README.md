@@ -18,8 +18,8 @@ analysis evidence, not a safety certificate.
   `not_verified` (not fully read) or `remote_code` (runs the repo's own Python).
 - A repo with a **flagged** file is withheld. It is reviewed by a person first, so a
   false alarm is fixed in Hayward instead, and a real finding is reported privately
-  to Hugging Face. A signed "withheld" marker after a 30-day disclosure window is
-  planned, not built yet.
+  to Hugging Face. 30 days after that report, the checkpoint names the repo and
+  commit as `withheld`: no file names, hashes or rules.
 - So "no published verdict" means not scanned yet, or withheld. It is never a pass.
 - Verdicts are re-signed every 6 hours and stop counting after 30 days.
 
@@ -53,6 +53,15 @@ whole, or a head that went back, is caught too.
 A verdict is current while a checkpoint lists it. A rescan replaces a repo's verdicts.
 A verdict that is not rescanned drops out 30 days after its scan, or at once when the
 service moves to a new Hayward release, since the old scan never ran its new rules.
+
+Confirmed repo commits live in the `WITHHELD` Actions secret, a JSON list of
+`{"repo", "commit", "reported"}` (`reported` is the UTC date of the report, `YYYY-MM-DD`).
+The scan, sign and deploy jobs read it. A listed commit is never vouched for, and once 30 days
+have passed since `reported`, each checkpoint lists it under `withheld`. Update it with:
+
+```bash
+gh secret set WITHHELD -R hedgerow-dev/hayward-verify < withheld.json
+```
 
 ## Why you can trust a verdict
 
