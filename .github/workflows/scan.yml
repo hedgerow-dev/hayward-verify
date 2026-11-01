@@ -37,6 +37,7 @@ jobs:
       - name: Scan the most downloaded models
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WITHHELD: ${{ secrets.WITHHELD }}
         run: python verify_service.py scan --top 100 --out out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -86,6 +87,9 @@ jobs:
           path: .
       # Reads and verifies the published checkpoint, then signs the next one.
       - run: python verify_service.py sign --top 100 --scanned scanned.json out site
+        env:
+          # Repo commits review confirmed, each named in the checkpoint 30 days after its report.
+          WITHHELD: ${{ secrets.WITHHELD }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: site
@@ -120,3 +124,5 @@ jobs:
       # The home page, from this repo: it says what the service is and how to check.
       - run: cp index.html site/index.html
       - run: python verify_service.py deploy --top 100 --scanned scanned.json site
+        env:
+          WITHHELD: ${{ secrets.WITHHELD }}

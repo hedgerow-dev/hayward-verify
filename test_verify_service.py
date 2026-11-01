@@ -382,6 +382,84 @@ def test_an_entry_from_another_hayward_is_not_carried_forward():
     assert vs.current({LFS: [entry]}, set(), now, __version__) == {}
 
 
+def confirmed(*entries: tuple[str, str, int]) -> str:
+    """The WITHHELD secret: repo, commit, and the report date that many days ago."""
+    today = datetime.now(timezone.utc).date()
+    return json.dumps([{"repo": r, "commit": c, "reported": (today - timedelta(days=d)).isoformat()}
+                       for r, c, d in entries])
+
+
+def test_a_confirmed_repo_is_named_withheld_only_after_30_days(signing, tmp_path, monkeypatch):
+    _, _, put = signing
+    monkeypatch.setenv("WITHHELD", confirmed(("evil/old", "c" * 40, 30), ("evil/new", "d" * 40, 29)))
+    put("org/clean", statement("org/clean"))
+    site = run_sign(signing, tmp_path, 0, ["org/clean"])
+    _, cp = checkpoint(site, 0)
+    assert cp["predicate"]["withheld"] == [{"repo": "evil/old", "commit": "c" * 40}]
+    assert "evil/new" not in (site / "v1/checkpoints/0.sigstore.json").read_text()
+
+
+def test_no_secret_means_nothing_withheld(signing, tmp_path, monkeypatch):
+    _, _, put = signing
+    monkeypatch.delenv("WITHHELD", raising=False)
+    put("org/clean", statement("org/clean"))
+    _, cp = checkpoint(run_sign(signing, tmp_path, 0, ["org/clean"]), 0)
+    assert cp["predicate"]["withheld"] == []
+
+
+def test_a_confirmed_commit_is_never_vouched_for(signing, tmp_path, monkeypatch):
+    # Confirmed by review, even inside its window: neither a new receipt nor a carried
+    # entry for that commit stays current.
+    _, _, put = signing
+    put("org/clean", statement("org/clean"))
+    first = run_sign(signing, tmp_path, 0, ["other/repo"])
+    assert lookup(first, 0, LFS)
+    monkeypatch.setenv("WITHHELD", confirmed(("org/clean", SHA, 1)))
+    monkeypatch.setattr(vs, "top_repos", lambda n: ["other/repo"])  # not rescanned: would carry
+    put("other/repo", statement("other/repo"))
+    second = run_sign(signing, tmp_path, 1, ["other/repo"])
+    assert {e["repo"] for e in lookup(second, 1, LFS)} == {"other/repo"}
+
+
+def test_a_new_receipt_for_a_confirmed_commit_is_not_signed(signing, tmp_path, monkeypatch):
+    _, _, put = signing
+    monkeypatch.setenv("WITHHELD", confirmed(("org/clean", SHA, 1)))
+    put("org/clean", statement("org/clean"))
+    site = run_sign(signing, tmp_path, 0, ["org/clean"])
+    assert not (site / "v1/hf/org/clean").exists() and lookup(site, 0, LFS) == []
+
+
+def test_scan_writes_no_receipt_for_a_confirmed_commit(scanned, monkeypatch):
+    out, _ = scanned
+    monkeypatch.setenv("WITHHELD", confirmed(("org/clean", SHA, 1)))
+    vs.cmd_scan(Namespace(top=4, out=str(out)))
+    assert not (out / "v1/hf/org/clean").exists() and (out / "v1/hf/org/code").exists()
+
+
+def test_deploy_drops_the_live_files_of_a_confirmed_commit():
+    live = {f"/v1/hf/org/clean/{SHA}.json": "1", f"/v1/hf/org/clean/{SHA}.sigstore.json": "2",
+            f"/v1/hf/org/clean/{'e' * 40}.json": "3", "/v1/receipts/x.json": "4"}
+    assert vs.carried(live, set(), {("org/clean", SHA)}) == {
+        f"/v1/hf/org/clean/{'e' * 40}.json": "3", "/v1/receipts/x.json": "4"}
+
+
+@pytest.mark.parametrize("bad", ["not json", '{"repo": "a/b"}', '[{"repo": "a/b"}]',
+                                 '[{"repo": "bad repo", "commit": "' + "c" * 40 + '", "reported": "2026-01-01"}]',
+                                 '[{"repo": "a/b", "commit": "short", "reported": "2026-01-01"}]',
+                                 '[{"repo": "a/b", "commit": "' + "c" * 40 + '", "reported": "soon"}]',
+                                 '[{"repo": "a/b", "commit": "' + "c" * 40 + '", "reported": 20260101}]',
+                                 '[{"repo": "a/b", "commit": ' + "1" * 40 + ', "reported": "2026-01-01"}]',
+                                 "[" * 100_000])
+def test_a_malformed_secret_signs_nothing_and_echoes_nothing(signing, tmp_path, monkeypatch, bad):
+    _, _, put = signing
+    monkeypatch.setenv("WITHHELD", bad)
+    put("org/clean", statement("org/clean"))
+    with pytest.raises(SystemExit) as raised:
+        run_sign(signing, tmp_path, 0, ["org/clean"])
+    assert "a/b" not in str(raised.value) and "bad repo" not in str(raised.value)
+    assert not (tmp_path / "site0").exists()
+
+
 def test_sign_refuses_to_replace_a_published_checkpoint(signing, tmp_path):
     _, _, put = signing
     put("org/clean", statement("org/clean"))
