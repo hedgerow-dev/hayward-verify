@@ -222,7 +222,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
     # anything was withheld. Written first and again on each finding, so a run cut
     # short by a timeout still leaves what it found for review.
     encrypt_for_review(withheld, report)
-    with tempfile.TemporaryDirectory(prefix="verify-") as tmp:
+    # A killed scan leaves a folder owned by the container user that the runner cannot
+    # delete. The runner is thrown away after the job, so a failed cleanup is harmless.
+    with tempfile.TemporaryDirectory(prefix="verify-", ignore_cleanup_errors=True) as tmp:
         if getattr(args, "repos", None):
             repos = shard_of(json.loads(Path(args.repos).read_text(encoding="utf-8")), args.shard or "0/1")
         else:
