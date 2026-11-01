@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -254,7 +255,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
     encrypt_for_review(withheld, report)
     # A killed scan leaves a folder owned by the container user that the runner cannot
     # delete. The runner is thrown away after the job, so a failed cleanup is harmless.
-    with tempfile.TemporaryDirectory(prefix="verify-", ignore_cleanup_errors=True) as tmp:
+    # Not TemporaryDirectory: on Python 3.12 its cleanup tries to chmod that folder and
+    # raises even with ignore_cleanup_errors.
+    tmp = tempfile.mkdtemp(prefix="verify-")
+    try:
         if getattr(args, "repos", None):
             repos = shard_of(json.loads(Path(args.repos).read_text(encoding="utf-8")), args.shard or "0/1")
         else:
@@ -279,6 +283,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(json.dumps(statement, indent=1) + "\n", encoding="utf-8")
             published += 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     # Every repo this run scanned, withheld or not: deploy drops their older verdicts.
     # The same public top-N list, so it names nothing the site does not.
     (out.parent / "scanned.json").write_text(json.dumps(repos), encoding="utf-8")

@@ -72,6 +72,34 @@ def test_a_repo_with_nothing_scannable_is_not_written(monkeypatch, tmp_path):
     assert [p.relative_to(out).as_posix() for p in out.rglob("*.json")] == [f"v1/hf/org/clean/{SHA}.intoto.json"]
 
 
+def test_a_folder_the_runner_cannot_delete_does_not_fail_the_scan(monkeypatch, tmp_path):
+    # A killed scan leaves a folder owned by the container user. The runner may not
+    # chmod it, and Python 3.12's TemporaryDirectory raises on that even with
+    # ignore_cleanup_errors, which failed every shard after its whole list was scanned.
+    real_chmod = vs.os.chmod
+
+    def leave_locked_folder(repo, work):
+        (work / "tmp" / "hub").mkdir(parents=True)
+        (work / "tmp" / "hub" / "model.bin").write_bytes(b"x")
+        real_chmod(work / "tmp" / "hub", 0o000)
+        return statement(repo)
+
+    def no_chmod(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(vs.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(vs, "top_repos", lambda n: ["org/clean"])
+    monkeypatch.setattr(vs, "scan_repo", leave_locked_folder)
+    monkeypatch.setattr(vs, "encrypt_for_review", lambda report, out: None)
+    monkeypatch.setattr(vs.os, "chmod", no_chmod)
+    out = tmp_path / "out"
+    assert vs.cmd_scan(Namespace(top=1, out=str(out))) == 0
+    assert json.loads((out.parent / "scanned.json").read_text()) == ["org/clean"]
+    monkeypatch.undo()
+    for locked in tmp_path.glob("verify-*/0/tmp/hub"):
+        locked.chmod(0o700)
+
+
 def test_scan_logs_never_name_a_withheld_repo(scanned, capsys):
     out, _ = scanned
     vs.cmd_scan(Namespace(top=4, out=str(out)))
