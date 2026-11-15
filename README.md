@@ -25,11 +25,17 @@ analysis evidence, not a safety certificate.
 
 ## New uploads (dry run)
 
-A second workflow scans the model repos changed on the Hub in the last 6 hours, in
-8 shards, with the same locked-down containers. It signs and publishes nothing yet:
-it measures run time and the Hub's rate limits first. A flagged repo goes only into
-the encrypted review report. Past 20 repos in a run, an uploader's repos wait at the
-back of the queue, so one account cannot crowd out the rest.
+A second workflow scans model repos changed on the Hub since its previous successful
+run, in 8 shards, with the same locked-down containers. It signs and publishes
+nothing. A flagged repo goes only into the encrypted review report. Past 20 repos in
+a run, an uploader's repos wait at the back of the queue, so one account cannot
+crowd out the rest.
+
+The window starts at that run's watermark, minus 30 minutes of overlap. The watermark
+is how far the last fully successful run got. With no watermark yet, the window is
+the last 6 hours plus the same overlap. A run lists at most 2,400 repos, the oldest
+in the window, and leaves any newer ones for the next run. The watermark moves only
+when the list job and all 8 scan shards succeed, so a failed shard repeats its window.
 
 ## The verdict log
 

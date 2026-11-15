@@ -1,9 +1,14 @@
 name: New uploads (dry run)
 
-# Every 6 hours, scan the model repos changed on the Hub since the last run, in 8
-# shards. A dry run: nothing is signed or published. It measures how long a run takes
-# and whether the Hub's rate limits hold, before new uploads join the verdict log.
-# Flagged repos go only into the age-encrypted review report, as in the main scan.
+# Every 6 hours, scan model repos changed on the Hub since the last fully
+# successful run, in 8 shards. Nothing is signed or published. Flagged repos go
+# only into the age-encrypted review report, as in the main scan.
+#
+# The list window starts at the watermark from the last successful run, minus
+# 30 minutes. With no watermark, it falls back to the last 6 hours plus that
+# overlap. At most 2,400 repos are listed, oldest first; anything newer stays
+# in front of the watermark for the next run. The watermark job publishes the
+# new mark only after every scan shard succeeds.
 on:
   schedule:
     # 01:47, 07:47, ...: clear of the main scan at :17 every 6 hours, which shares
@@ -17,12 +22,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Two listing calls to the Hub API; no secrets.
+  # Hub listing, plus a read of this repo's last successful run. No Hugging Face token:
+  # the automatic token is limited to actions: read, for the watermark artifact.
   list:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,11 +38,22 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --require-hashes --no-deps -r requirements.txt
-      - run: python verify_service.py list-new --hours 6 --out new.json
+      - run: python verify_service.py list-new --hours 6 --out new.json --window-out watermark.json --from-actions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: new-list
           path: new.json
+          retention-days: 3
+          if-no-files-found: error
+      # The proposed mark. It counts only once the watermark job republishes it,
+      # which does not run unless every scan shard succeeded.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: window
+          path: watermark.json
           retention-days: 3
           if-no-files-found: error
 
@@ -79,4 +97,25 @@ jobs:
           name: withheld-${{ matrix.shard }}
           path: withheld.json.age
           retention-days: 30
+          if-no-files-found: error
+
+  # The run's watermark. needs: success, so a failed list or any failed shard leaves
+  # the previous mark in place and the next run repeats that window.
+  watermark:
+    needs: [list, scan]
+    if: ${{ success() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: window
+          path: .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: watermark
+          path: watermark.json
+          retention-days: 90
           if-no-files-found: error
