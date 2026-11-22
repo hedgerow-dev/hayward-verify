@@ -12,6 +12,8 @@ Every 6 hours this repo scans the most downloaded models with `hayward hub` at t
 current commit, signs each verdict with Sigstore, and publishes it. A verdict is
 analysis evidence, not a safety certificate.
 
+Follow [@Hedgerowdotdev](https://x.com/Hedgerowdotdev) on X for releases and research.
+
 ## What gets published
 
 - A repo with **no flagged file** is published, with each file's verdict: `clean`,
