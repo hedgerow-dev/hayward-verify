@@ -359,9 +359,9 @@ email-validator==2.3.0 \
     --hash=sha256:80f13f623413e6b197ae73bb10bf4eb0908faf509ad8362c5edeb0be7fd450b4 \
     --hash=sha256:9fc05c37f2f6cf439ff414f8fc46d917929974a82244c20eb10231ba60c54426
     # via pydantic
-hayward==1.18.0 \
-    --hash=sha256:d81b4fdbaba751e18b13aa8901a9a21f945816351b7ab6294f312cc2badef5ba \
-    --hash=sha256:fa3862222327c0989b906ef06d913e94add587de4831e1dc771760b7f31fcded
+hayward==1.18.1 \
+    --hash=sha256:59979d91971d4c07c3bb9084a7973b21242a9d3e9d728e65bd9f37ea134c38b7 \
+    --hash=sha256:a81456e7188a85e5c0db1fca40d66191d3a3bbc3425f0db085b9bf2b8359a70f
     # via -r requirements.in
 id==1.6.1 \
     --hash=sha256:d0732d624fb46fd4e7bc4e5152f00214450953b9e772c182c1c22964def1a069 \
