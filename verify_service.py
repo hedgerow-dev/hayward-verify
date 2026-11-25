@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -44,10 +45,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HUB = "https://huggingface.co"
+GITHUB = "https://api.github.com"
 REVIEW_KEY = Path(__file__).with_name("review.age.pub")
 SCAN_TIMEOUT_SECONDS = 900
 SCANNER_IMAGE = "hayward-verify-scanner:local"  # built from ./Dockerfile by the workflow
@@ -59,10 +62,18 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 # hayward.hub's patterns, copied: deploy installs no packages.
 REPO_RE = re.compile(r"\w[\w.-]{0,95}/\w[\w.-]{0,95}")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 REPORT_BLOCK = 256 * 1024  # the withheld report is padded to a multiple of this
 NEW_SLACK = timedelta(minutes=30)  # runs overlap by this much, so a late run misses nothing
 PER_OWNER_CAP = 20  # new repos per uploader scanned before everyone else's are
-MAX_LIST_PAGES = 50  # 1,000 repos a page: far more than any 6-hour window holds
+# 1,000 repos a page. Past this, list-new refuses the window instead of skipping the unread tail.
+MAX_LIST_PAGES = 100
+# 15 Nov 2026: the slowest shard scanned 272 repos in 198 min; the step limit is 270.
+# 2,400 repos is 300 per shard, about 220 min at that pace. A normal 6-hour window
+# (2,175 that day) fits. Anything newer than the oldest 2,400 waits for the next run.
+MAX_NEW_REPOS = 2400
+WATERMARK_NAME = "watermark"  # artifact published only after every scan shard succeeds
+WATERMARK_FUTURE_SKEW = timedelta(minutes=5)
 CHECKPOINT_TYPE = "https://hedgerow.dev/hayward/checkpoint/v1"
 # A verdict not rescanned stays in the checkpoint this long after its scan: the same
 # limit the client puts on a per-repo bundle.
@@ -106,56 +117,162 @@ def _page(url: str) -> tuple[bytes, str | None]:
     """One page of a Hub listing and the URL of the next, from its Link header."""
     if urllib.parse.urlsplit(url).scheme != "https":
         raise ValueError("refusing a non-https URL")
-    with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:  # noqa: S310 - https checked
-        body = resp.read()
-        link = resp.headers.get("Link", "")
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=60) as resp:  # noqa: S310 - https checked
+                body = resp.read()
+                link = resp.headers.get("Link", "")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 4:
+                raise
+            time.sleep(10 * 2 ** attempt)
     nxt = next((part.split(";")[0].strip(" <>") for part in link.split(",") if 'rel="next"' in part), None)
     if nxt is not None and not nxt.startswith(f"{HUB}/api/models?"):
         raise ValueError("the Hub's next page is not a model listing")
     return body, nxt
 
 
-def new_repos(hours: float, now: datetime) -> list[str]:
-    """Public, ungated model repos changed in the last ``hours`` (plus slack, so runs
-    overlap) that hold a file Hayward scans, newest first. One listing page carries each
-    repo's file list, so a 6-hour window costs a few API calls, not one per repo."""
+def _when(value: object) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None
+    return when.astimezone(timezone.utc)
+
+
+def _collect_changed(since: datetime) -> list[tuple[datetime, str]]:
+    """Public, ungated repos changed at or after ``since``, newest first, that hold a file Hayward scans.
+
+    One listing page carries each repo's file list. Stops at the first repo older than ``since``.
+    Refuses a window the page cap did not reach, so the unread older tail cannot be skipped.
+    """
     from hayward import hub
 
     suffixes = hub._scannable_suffixes()
-    since = now - timedelta(hours=hours) - NEW_SLACK
     query = urllib.parse.urlencode([("sort", "lastModified"), ("direction", "-1"), ("limit", "1000"),
                                     ("expand[]", "lastModified"), ("expand[]", "siblings"),
                                     ("expand[]", "gated"), ("expand[]", "private")])
     url: str | None = f"{HUB}/api/models?{query}"
-    repos: list[str] = []
-    later: list[str] = []
-    per_owner: dict[str, int] = {}
-    for _ in range(MAX_LIST_PAGES):
-        if url is None:
-            break
+    found: list[tuple[datetime, str]] = []
+    pages = 0
+    while url is not None:
+        if pages >= MAX_LIST_PAGES:
+            raise SystemExit(
+                f"the Hub listing hit {MAX_LIST_PAGES} pages before {since.isoformat()}; "
+                "refusing a partial window")
+        pages += 1
         body, url = _page(url)
         page = json.loads(body)
         for m in page if isinstance(page, list) else []:
             if not isinstance(m, dict):
                 continue
-            try:
-                when = datetime.fromisoformat(str(m.get("lastModified")).replace("Z", "+00:00"))
-            except ValueError:
+            when = _when(m.get("lastModified"))
+            if when is None:
                 continue
             if when < since:
-                return repos + later
+                return found
             repo = str(m.get("id", ""))
             siblings = m.get("siblings") if isinstance(m.get("siblings"), list) else []
             if (not hub.REPO_RE.fullmatch(repo) or m.get("private") or m.get("gated")
                     or not any(isinstance(f, dict) and hub._wanted(str(f.get("rfilename", "")), suffixes)
                                for f in siblings)):
                 continue
-            # One uploader cannot crowd out the rest: past its share, its repos go to the
-            # back of the queue. They are still scanned, after everyone else's.
-            owner = repo.split("/", 1)[0]
-            per_owner[owner] = per_owner.get(owner, 0) + 1
-            (repos if per_owner[owner] <= PER_OWNER_CAP else later).append(repo)
+            found.append((when, repo))
+    return found
+
+
+def _queue(entries: list[tuple[datetime, str]]) -> list[str]:
+    """Newest first. Past its share, an owner's repos wait at the back and are still scanned."""
+    repos: list[str] = []
+    later: list[str] = []
+    per_owner: dict[str, int] = {}
+    for _, repo in entries:
+        owner = repo.split("/", 1)[0]
+        per_owner[owner] = per_owner.get(owner, 0) + 1
+        (repos if per_owner[owner] <= PER_OWNER_CAP else later).append(repo)
     return repos + later
+
+
+def _oldest_within(found: list[tuple[datetime, str]], limit: int) -> tuple[list[tuple[datetime, str]], datetime | None]:
+    """Keep the oldest repos in ``found`` (newest first), up to ``limit``, without splitting a timestamp.
+
+    Returns those repos newest first, and the oldest deferred timestamp, or None when nothing is deferred.
+    The first timestamp is kept whole even when it is larger than ``limit``, so one instant cannot stall.
+    """
+    if limit < 1:
+        raise SystemExit("the new-repo limit must be at least 1")
+    oldest_first = list(reversed(found))
+    selected: list[tuple[datetime, str]] = []
+    index = 0
+    while index < len(oldest_first):
+        stamp = oldest_first[index][0]
+        group: list[tuple[datetime, str]] = []
+        while index < len(oldest_first) and oldest_first[index][0] == stamp:
+            group.append(oldest_first[index])
+            index += 1
+        if selected and len(selected) + len(group) > limit:
+            return list(reversed(selected)), stamp
+        selected.extend(group)
+        if len(selected) >= limit and index < len(oldest_first):
+            return list(reversed(selected)), oldest_first[index][0]
+    return list(reversed(selected)), None
+
+
+def _newest_within(found: list[tuple[datetime, str]], limit: int) -> list[tuple[datetime, str]]:
+    """Newest whole timestamps from ``found`` (already newest first) that fit in ``limit``."""
+    selected: list[tuple[datetime, str]] = []
+    index = 0
+    while index < len(found) and limit > 0:
+        stamp = found[index][0]
+        group: list[tuple[datetime, str]] = []
+        while index < len(found) and found[index][0] == stamp:
+            group.append(found[index])
+            index += 1
+        if len(selected) + len(group) > limit:
+            break
+        selected.extend(group)
+    return selected
+
+
+def plan_new_repos(hours: float, now: datetime, since: datetime | None = None,
+                   limit: int = MAX_NEW_REPOS) -> tuple[list[str], datetime, datetime, bool]:
+    """Repos to scan, the watermark to publish if the run succeeds, the window start, and whether any were deferred.
+
+    ``since`` is the previous run's covered_until. The window starts ``NEW_SLACK`` before it, so a late
+    listing still overlaps. With no watermark, the window is the last ``hours`` plus that same slack.
+    Repos at or after ``since`` are the ones not covered yet and are taken first, oldest first, up to
+    ``limit``. The overlap behind ``since`` fills only whatever room is left, so it cannot crowd out the
+    deferred tail. The returned watermark is the oldest deferred modification time.
+    """
+    if since is None:
+        start = now - timedelta(hours=hours) - NEW_SLACK
+        fresh_from = start
+    else:
+        if since.tzinfo is None:
+            raise SystemExit("the watermark has no timezone")
+        since = since.astimezone(timezone.utc)
+        start = since - NEW_SLACK
+        fresh_from = since
+    found = _collect_changed(start)
+    fresh = [item for item in found if item[0] >= fresh_from]
+    overlap = [item for item in found if item[0] < fresh_from]
+    chosen_fresh, boundary = _oldest_within(fresh, limit)
+    room = limit - len(chosen_fresh)
+    extra = _newest_within(overlap, room) if room > 0 else []
+    chosen = chosen_fresh + extra  # both parts are newest first, and fresh is newer than the overlap
+    # A deferred timestamp in the future means everything up to now was selected.
+    if boundary is None or boundary > now:
+        return _queue(chosen), now, start, False
+    return _queue(chosen), boundary, start, True
+
+
+def new_repos(hours: float, now: datetime, since: datetime | None = None,
+              limit: int = MAX_NEW_REPOS) -> list[str]:
+    """Public, ungated model repos to scan, newest first, with each owner's extras at the back."""
+    return plan_new_repos(hours, now, since, limit)[0]
 
 
 def shard_of(repos: list[str], shard: str) -> list[str]:
@@ -294,10 +411,123 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _github_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+            "User-Agent": "hayward-verify", "X-GitHub-Api-Version": "2022-11-28"}
+
+
+class _ReturnRedirects(urllib.request.HTTPErrorProcessor):
+    """Leave 3xx responses in place so an artifact URL can be fetched without the token."""
+
+    def http_response(self, request: urllib.request.Request, response):
+        return response
+
+    https_response = http_response
+
+
+def _github_json(url: str, token: str) -> dict:
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("refusing a non-https URL")
+    req = urllib.request.Request(url, headers=_github_headers(token))  # noqa: S310 - https checked
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 - https checked
+                body = json.loads(resp.read().decode())
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 4:
+                raise
+            time.sleep(2 ** attempt)
+    if not isinstance(body, dict):
+        raise SystemExit("the GitHub API did not return an object")
+    return body
+
+
+def _github_artifact_zip(repository: str, token: str, artifact_id: int) -> bytes:
+    url = f"{GITHUB}/repos/{repository}/actions/artifacts/{artifact_id}/zip"
+    if urllib.parse.urlsplit(url).scheme != "https":
+        raise ValueError("refusing a non-https URL")
+    req = urllib.request.Request(url, headers=_github_headers(token))  # noqa: S310 - https checked
+    opener = urllib.request.build_opener(_ReturnRedirects)
+    with opener.open(req, timeout=60) as resp:
+        status = resp.status
+        if status in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location", "")
+            if urllib.parse.urlsplit(loc).scheme != "https":
+                raise ValueError("refusing a non-https artifact URL")
+            with urllib.request.urlopen(loc, timeout=60) as blob:  # noqa: S310 - https checked above
+                return blob.read()
+        if status != 200:
+            raise SystemExit(f"the watermark artifact download returned {status}")
+        return resp.read()
+
+
+def _watermark_from_zip(blob: bytes) -> datetime:
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+            names = [name for name in archive.namelist()
+                     if Path(name).name == "watermark.json" and not Path(name).is_absolute()
+                     and ".." not in Path(name).parts]
+            if len(names) != 1:
+                raise SystemExit("the watermark artifact does not contain watermark.json")
+            data = json.loads(archive.read(names[0]))
+        if not isinstance(data, dict):
+            raise SystemExit("the watermark artifact is not {covered_until}")
+        when = _when(data.get("covered_until"))
+    except (KeyError, TypeError, ValueError, zipfile.BadZipFile):
+        raise SystemExit("the watermark artifact is not {covered_until}") from None
+    if when is None:
+        raise SystemExit("the watermark covered_until has no timezone")
+    return when
+
+
+def fetch_covered_until(repository: str, token: str, now: datetime | None = None) -> datetime | None:
+    """covered_until from the newest successful run whose watermark artifact is still there, or None.
+
+    An API or artifact error is raised: a missing watermark falls back, a failed read must not.
+    """
+    if not repository or not token:
+        raise SystemExit("GITHUB_REPOSITORY and GITHUB_TOKEN are required to read the watermark")
+    if not GITHUB_REPO_RE.fullmatch(repository):
+        raise SystemExit("GITHUB_REPOSITORY is not owner/name")
+    now = now or _now()
+    listed = _github_json(
+        f"{GITHUB}/repos/{repository}/actions/workflows/new-uploads.yml/runs?status=success&per_page=5", token)
+    for run in listed.get("workflow_runs") or []:
+        if not isinstance(run, dict) or run.get("conclusion") != "success" or not isinstance(run.get("id"), int):
+            continue
+        artifacts = _github_json(
+            f"{GITHUB}/repos/{repository}/actions/runs/{run['id']}/artifacts?per_page=100", token)
+        artifact = next((item for item in artifacts.get("artifacts") or []
+                         if isinstance(item, dict) and item.get("name") == WATERMARK_NAME
+                         and not item.get("expired") and isinstance(item.get("id"), int)), None)
+        if artifact is None:
+            continue
+        when = _watermark_from_zip(_github_artifact_zip(repository, token, artifact["id"]))
+        if when > now + WATERMARK_FUTURE_SKEW:
+            raise SystemExit("the watermark covered_until is too far in the future")
+        return min(when, now)
+    return None
+
+
 def cmd_list_new(args: argparse.Namespace) -> int:
-    repos = new_repos(args.hours, datetime.now(timezone.utc))
+    now = _now()
+    watermark = None
+    if args.from_actions:
+        watermark = fetch_covered_until(os.environ.get("GITHUB_REPOSITORY", ""),
+                                        os.environ.get("GITHUB_TOKEN", ""), now)
+    repos, covered, start, deferred = plan_new_repos(args.hours, now, watermark, args.limit)
     Path(args.out).write_text(json.dumps(repos), encoding="utf-8")
-    print(f"listed {len(repos)} repo(s) changed in the last {args.hours:g} hour(s)")
+    if args.window_out:
+        mark = {"covered_until": covered.astimezone(timezone.utc).isoformat()}
+        Path(args.window_out).write_text(json.dumps(mark) + "\n", encoding="utf-8")
+    extra = "; deferred the rest" if deferred else ""
+    print(f"listed {len(repos)} repo(s) since {start.isoformat(timespec='seconds')}; "
+          f"covered until {covered.isoformat(timespec='seconds')}{extra}")
     return 0
 
 
@@ -704,9 +934,13 @@ def main(argv: list[str] | None = None) -> int:
     sign.add_argument("--scanned", required=True, help="scanned.json from the scan job")
     sign.add_argument("src")
     sign.add_argument("site")
-    list_new = sub.add_parser("list-new", help="list repos changed on the Hub in the last HOURS")
-    list_new.add_argument("--hours", type=float, default=6)
+    list_new = sub.add_parser("list-new", help="list repos changed on the Hub since the last watermark")
+    list_new.add_argument("--hours", type=float, default=6, help="window when there is no watermark")
     list_new.add_argument("--out", required=True)
+    list_new.add_argument("--window-out", help="write {covered_until} for the watermark job")
+    list_new.add_argument("--from-actions", action="store_true",
+                          help="read the watermark from the last successful run")
+    list_new.add_argument("--limit", type=int, default=MAX_NEW_REPOS, help="max repos in this run")
     deploy = sub.add_parser("deploy")
     deploy.add_argument("--top", type=int, default=100)
     deploy.add_argument("--scanned", required=True, help="scanned.json from the scan job")

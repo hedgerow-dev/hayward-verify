@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import shutil
+import zipfile
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -228,6 +230,160 @@ def test_a_malformed_listing_entry_is_skipped(listing):
     pages, _ = listing
     pages.append(["junk", {"id": "a/b"}, {**model("c/d", 1), "siblings": None}, model("e/f", 2)])
     assert vs.new_repos(6, NOW) == ["e/f"]
+
+
+def test_a_watermark_overrides_the_fixed_window_and_keeps_slack(listing):
+    pages, urls = listing
+    pages.append([model("a/new", 10), model("a/edge", 100), model("a/out", 130)])
+    watermark = NOW - timedelta(minutes=90)
+    repos, covered, start, deferred = vs.plan_new_repos(6, NOW, since=watermark, limit=100)
+    assert start == watermark - vs.NEW_SLACK
+    assert repos == ["a/new", "a/edge"]  # 90 min ago, minus the 30 min slack; not the 6.5 h window
+    assert covered == NOW and not deferred
+    assert len(urls) == 1
+
+
+def test_a_long_window_keeps_the_oldest_and_defers_the_newer(listing):
+    pages, _ = listing
+    pages.append([model(f"spam/r{i}", i) for i in range(30)] + [model("other/old", 200)])
+    repos, covered, _, deferred = vs.plan_new_repos(6, NOW, limit=5)
+    assert deferred
+    assert repos == ["spam/r26", "spam/r27", "spam/r28", "spam/r29", "other/old"]
+    assert "spam/r0" not in repos
+    assert covered == NOW - timedelta(minutes=25)
+
+
+def test_a_timestamp_is_not_split_across_runs(listing):
+    pages, _ = listing
+    pages.append([model("a/n1", 10), model("a/n2", 10), model("a/o1", 40), model("a/o2", 40)])
+    repos, covered, _, deferred = vs.plan_new_repos(6, NOW, limit=3)
+    assert repos == ["a/o1", "a/o2"] and deferred
+    assert covered == NOW - timedelta(minutes=10)
+    pages.clear()
+    pages.append([model("a/n1", 10), model("a/n2", 10), model("a/o1", 40), model("a/o2", 40)])
+    again, next_covered, start, deferred_again = vs.plan_new_repos(6, NOW, since=covered, limit=3)
+    assert start == covered - vs.NEW_SLACK
+    assert again == ["a/n1", "a/n2"] and not deferred_again and next_covered == NOW
+
+
+def test_one_timestamp_larger_than_the_cap_is_kept_whole(listing):
+    pages, _ = listing
+    pages.append([model(f"a/r{i}", 10) for i in range(4)])
+    repos, covered, _, deferred = vs.plan_new_repos(6, NOW, limit=2)
+    assert len(repos) == 4 and not deferred and covered == NOW
+
+
+def test_a_listing_that_never_reaches_the_watermark_is_refused(listing, monkeypatch):
+    pages, _ = listing
+    monkeypatch.setattr(vs, "MAX_LIST_PAGES", 1)
+    pages += [[model("a/new", 1)], [model("a/older", 2)]]
+    with pytest.raises(SystemExit):
+        vs.plan_new_repos(6, NOW)
+
+
+def test_the_end_of_the_hub_counts_as_the_windows_edge(listing, monkeypatch):
+    pages, _ = listing
+    monkeypatch.setattr(vs, "MAX_LIST_PAGES", 1)
+    pages.append([model("a/only", 1)])
+    repos, covered, _, deferred = vs.plan_new_repos(6, NOW)
+    assert repos == ["a/only"] and covered == NOW and not deferred
+
+
+def _zip_watermark(when: datetime) -> bytes:
+    blob = io.BytesIO()
+    with zipfile.ZipFile(blob, "w") as archive:
+        archive.writestr("watermark.json", json.dumps({"covered_until": when.isoformat()}))
+    return blob.getvalue()
+
+
+def test_fetch_covered_until_skips_an_expired_artifact(monkeypatch):
+    calls = []
+    downloaded = []
+
+    def fake_json(url, token):
+        calls.append(url)
+        if url.endswith("/runs?status=success&per_page=5"):
+            return {"workflow_runs": [{"id": 9, "conclusion": "success"}, {"id": 8, "conclusion": "success"}]}
+        if url.endswith("/runs/9/artifacts?per_page=100"):
+            return {"artifacts": [{"id": 2, "name": "watermark", "expired": True}]}
+        if url.endswith("/runs/8/artifacts?per_page=100"):
+            return {"artifacts": [{"id": 3, "name": "watermark", "expired": False}]}
+        raise AssertionError(url)
+
+    def fake_zip(repo, token, art_id):
+        downloaded.append(art_id)
+        return _zip_watermark(NOW - timedelta(hours=2))
+
+    monkeypatch.setattr(vs, "_github_json", fake_json)
+    monkeypatch.setattr(vs, "_github_artifact_zip", fake_zip)
+    got = vs.fetch_covered_until("hedgerow-dev/hayward-verify", "tok", now=NOW)
+    assert got == NOW - timedelta(hours=2)
+    assert calls[0].endswith("status=success&per_page=5")
+    assert downloaded == [3]
+
+
+def test_fetch_covered_until_falls_back_when_no_run_has_a_watermark(monkeypatch):
+    def fake_json(url, token):
+        if "artifacts" in url:
+            return {"artifacts": [{"id": 1, "name": "new-list", "expired": False}]}
+        return {"workflow_runs": [{"id": 4, "conclusion": "success"}]}
+
+    monkeypatch.setattr(vs, "_github_json", fake_json)
+    monkeypatch.setattr(vs, "_github_artifact_zip", lambda *args: pytest.fail("no artifact"))
+    assert vs.fetch_covered_until("hedgerow-dev/hayward-verify", "tok", now=NOW) is None
+
+
+def test_a_broken_watermark_stops_the_list(monkeypatch):
+    def fake_json(url, token):
+        if "artifacts" in url:
+            return {"artifacts": [{"id": 4, "name": "watermark", "expired": False}]}
+        return {"workflow_runs": [{"id": 1, "conclusion": "success"}]}
+
+    monkeypatch.setattr(vs, "_github_json", fake_json)
+    monkeypatch.setattr(vs, "_github_artifact_zip", lambda *args: b"not a zip")
+    with pytest.raises(SystemExit):
+        vs.fetch_covered_until("acme/widgets", "t", now=NOW)
+
+
+def test_a_future_watermark_stops_the_list(monkeypatch):
+    def fake_json(url, token):
+        if "artifacts" in url:
+            return {"artifacts": [{"id": 4, "name": "watermark", "expired": False}]}
+        return {"workflow_runs": [{"id": 1, "conclusion": "success"}]}
+
+    monkeypatch.setattr(vs, "_github_json", fake_json)
+    monkeypatch.setattr(vs, "_github_artifact_zip",
+                        lambda *args: _zip_watermark(NOW + timedelta(hours=1)))
+    with pytest.raises(SystemExit):
+        vs.fetch_covered_until("acme/widgets", "t", now=NOW)
+
+
+def test_fetch_covered_until_rejects_a_bad_repository():
+    with pytest.raises(SystemExit):
+        vs.fetch_covered_until("not a repo", "t", now=NOW)
+
+
+def test_list_new_records_the_window_it_will_cover(listing, tmp_path, monkeypatch):
+    pages, _ = listing
+    pages.append([model("a/ok", 5)])
+    monkeypatch.setattr(vs, "fetch_covered_until", lambda repository, token, now=None: NOW - timedelta(hours=3))
+    monkeypatch.setattr(vs, "_now", lambda: NOW)
+    out, window = tmp_path / "new.json", tmp_path / "watermark.json"
+    rc = vs.cmd_list_new(Namespace(hours=6, out=str(out), window_out=str(window),
+                                   from_actions=True, limit=vs.MAX_NEW_REPOS))
+    assert rc == 0
+    assert json.loads(out.read_text()) == ["a/ok"]
+    assert json.loads(window.read_text())["covered_until"] == NOW.isoformat()
+
+
+def test_list_new_without_a_watermark_does_not_call_the_api(listing, tmp_path, monkeypatch):
+    pages, _ = listing
+    pages.append([model("a/ok", 5)])
+    monkeypatch.setattr(vs, "fetch_covered_until", lambda *args, **kwargs: pytest.fail("no api"))
+    monkeypatch.setattr(vs, "_now", lambda: NOW)
+    out = tmp_path / "new.json"
+    rc = vs.cmd_list_new(Namespace(hours=6, out=str(out), window_out=None, from_actions=False, limit=100))
+    assert rc == 0 and json.loads(out.read_text()) == ["a/ok"]
 
 
 def test_a_timed_out_container_is_killed(monkeypatch, tmp_path):
