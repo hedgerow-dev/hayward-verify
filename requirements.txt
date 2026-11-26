@@ -351,15 +351,15 @@ defusedxml==0.7.1 \
     --hash=sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69 \
     --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
     # via hayward
-dnspython==2.9.1 \
-    --hash=sha256:7c81caf8de1ed57b8cfc7e0ad4f528a0b8ceace473c7eb946df195dc9def751f \
-    --hash=sha256:9a6d30e55f8dc63e6052597666112bff0586b95a2474a9deda03afbbf820d37a
+dnspython==2.9.2 \
+    --hash=sha256:8d4d39a513e649d634004ce4d39ade2352efcea472a0247535a5c2d18a9d7ba9 \
+    --hash=sha256:af15f7d385a6ae2fb35a796fde2138004c8c42c7389090e2addc83e3b3340fd8
     # via email-validator
 email-validator==2.3.0 \
     --hash=sha256:80f13f623413e6b197ae73bb10bf4eb0908faf509ad8362c5edeb0be7fd450b4 \
     --hash=sha256:9fc05c37f2f6cf439ff414f8fc46d917929974a82244c20eb10231ba60c54426
     # via pydantic
-hayward==1.18.3 \
+hayward[sign]==1.18.3 \
     --hash=sha256:b1c23c89a4f1a8045095fa1f101fc3862ccec1ac48262d1d8fd566321226844e \
     --hash=sha256:cfebb4caf55c05a1f6e4847c1951fd5360edf027e76ef34600ce349e2add5462
     # via -r requirements.in
@@ -389,7 +389,7 @@ pycparser==3.12 \
     --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e \
     --hash=sha256:f03387877eab82ce01bbdfd0ba7252ee55a90b1c708d5129e2ce915475cf1db6
     # via cffi
-pydantic==2.14.2 \
+pydantic[email]==2.14.2 \
     --hash=sha256:7efbf7507b937931cd32a5755acb00ea1cf5ccb1d4e8067a5850d5069e382118 \
     --hash=sha256:fb7b2db6cefe8414dd612edeede49c4c433acb0432b0f92b95024e45f66c505d
     # via
